@@ -1,0 +1,9 @@
+# Workspace 明确纳入产品 packages 与独立官网 apps；官网不进入产品 Docker/Worker 构建链路。
+packages:
+  - "packages/*"
+  - "apps/*"
+allowBuilds:
+  '@tsparticles/engine': true
+  esbuild: true
+  sharp: true
+  workerd: true
