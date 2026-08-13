@@ -41,7 +41,7 @@
     {
       "binding": "DB",
       "database_name": "renewlet",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "f6fa9237-7ffd-4c1e-8f8f-d3e6faa07b3a",
       "migrations_dir": "apps/worker/migrations"
     }
   ],
