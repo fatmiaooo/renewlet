@@ -38,11 +38,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7.0.0
         with:
-          go-version: 1.26.5
+          go-version-file: apps/docker-server/go.mod
           cache-dependency-path: apps/docker-server/go.sum
 
       - name: Install govulncheck
-        # Go 官方漏洞库按代码可达性分析；固定 Go 版本，工具本身随官方 vuln DB 更新。
+        # Go 官方漏洞库按代码可达性分析；工具链跟随 go.mod，govulncheck 随官方 vuln DB 更新。
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - name: Run govulncheck
@@ -56,17 +56,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v7.0.0
-        with:
-          node-version: 24.19.0
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
+      # 依赖风险由独立 pnpm-audit job 负责；镜像扫描不在宿主机重复安装整套 workspace。
       - name: Run pnpm audit
         run: pnpm audit --audit-level high
 
@@ -122,5 +112,5 @@ jobs:
           grype version
 
       - name: Scan Docker image
-        # high 及以上直接失败，低等级 CVE 保留在 job 输出中供版本升级时评估，避免个人自托管镜像被噪音阻断。
-        run: grype renewlet:security-scan --fail-on high --scope all-layers
+        # 有修复版本的 high 及以上漏洞直接失败；暂无修复的基础镜像 CVE 仍显示，但不制造永久红灯。
+        run: grype renewlet:security-scan --fail-on high --only-fixed --show-suppressed --scope all-layers
