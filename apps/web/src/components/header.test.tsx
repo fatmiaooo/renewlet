@@ -16,11 +16,10 @@ const mocks = vi.hoisted(() => ({
   useSystemUpdate: vi.fn(),
   useSystemUpdateStatus: vi.fn(),
   useSystemRestart: vi.fn(),
-  toast: vi.fn(),
+  toast: { success: vi.fn(), error: vi.fn() },
   setTheme: vi.fn(),
   theme: "dark",
   writeAppearancePendingToStorage: vi.fn(),
-  scheduleAuthenticatedRoutePreloads: vi.fn(() => vi.fn()),
   useRoutePreloadPending: vi.fn(() => false),
 }));
 
@@ -38,8 +37,8 @@ vi.mock("@/hooks/use-system-version", () => ({
   useSystemRestart: mocks.useSystemRestart,
 }));
 
-vi.mock("@/hooks/use-toast", () => ({
-  useToast: () => ({ toast: mocks.toast }),
+vi.mock("@/components/ui/sonner", () => ({
+  toast: mocks.toast,
 }));
 
 vi.mock("@/lib/theme-provider", () => ({
@@ -54,7 +53,6 @@ vi.mock("@/lib/theme-storage", () => ({
 }));
 
 vi.mock("@/lib/route-resources", () => ({
-  scheduleAuthenticatedRoutePreloads: mocks.scheduleAuthenticatedRoutePreloads,
   useRoutePreloadPending: mocks.useRoutePreloadPending,
 }));
 
@@ -77,7 +75,6 @@ vi.mock("@/i18n/I18nProvider", () => ({
         "system.checkDeferredTitle": "暂时无法检查更新",
         "system.currentVersion": "当前版本",
         "system.latestVersion": "最新版本",
-        "system.noUpdateDescription": "无需操作。",
         "system.noUpdateTitle": "已是最新版本",
         "system.openUpdateDialog": "打开系统更新",
         "system.cloudflareDeployGuide": "Cloudflare 部署说明",
@@ -171,12 +168,11 @@ describe("Header system version entry", () => {
     mocks.useSystemUpdate.mockReset();
     mocks.useSystemUpdateStatus.mockReset();
     mocks.useSystemRestart.mockReset();
-    mocks.toast.mockReset();
+    mocks.toast.success.mockReset();
+    mocks.toast.error.mockReset();
     mocks.setTheme.mockReset();
     mocks.theme = "dark";
     mocks.writeAppearancePendingToStorage.mockReset();
-    mocks.scheduleAuthenticatedRoutePreloads.mockReset();
-    mocks.scheduleAuthenticatedRoutePreloads.mockReturnValue(vi.fn());
     mocks.useRoutePreloadPending.mockReset();
     mocks.useRoutePreloadPending.mockReturnValue(false);
     mocks.useSystemVersion.mockReturnValue({
@@ -250,15 +246,13 @@ describe("Header system version entry", () => {
 
     expect(screen.queryByRole("button", { name: "打开系统更新" })).not.toBeInTheDocument();
     expect(mocks.useSystemVersion).not.toHaveBeenCalled();
-    expect(mocks.scheduleAuthenticatedRoutePreloads).not.toHaveBeenCalled();
   });
 
-  it("preloads primary routes after sign-in without changing header layout", () => {
+  it("keeps the header stable after sign-in without scheduling private route preloads", () => {
     mocks.useSession.mockReturnValue(adminSession("user"));
 
     renderHeader();
 
-    expect(mocks.scheduleAuthenticatedRoutePreloads).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("app-header-route-preload-indicator")).toHaveClass("opacity-0");
   });
 

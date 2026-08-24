@@ -6,13 +6,19 @@ import {
 import {
   normalizeSettingsValue,
 } from "@renewlet/shared/settings-normalization";
-import { apiSubscriptionSchema, type ApiSubscription } from "@renewlet/shared/schemas/subscriptions";
+import {
+  apiSubscriptionCollectionItemSchema,
+  apiSubscriptionSchema,
+  type ApiSubscription,
+  type ApiSubscriptionCollectionItem,
+} from "@renewlet/shared/schemas/subscriptions";
+import { publicApiSubscriptionSchema } from "@renewlet/shared/schemas/public-api";
 import { customConfigSchema } from "@renewlet/shared/schemas/custom-config";
 import { DISABLED_REMINDER_DAYS, MAX_REMINDER_DAYS } from "@renewlet/shared/runtime";
 import { moneyFromUnknown } from "@renewlet/shared/money";
 import type { AdminUser } from "@renewlet/shared/schemas/admin";
 import type { AssetInUseDetails } from "@renewlet/shared/schemas/media";
-import type { ApiTokenRow, AssetRow, Env, NotificationJobRow, SubscriptionRow, TelegramBotBindingRow, UserRow } from "./types";
+import type { ApiTokenRow, AssetRow, Env, NotificationJobRow, SubscriptionCollectionRow, SubscriptionRow, TelegramBotBindingRow, UserRow } from "./types";
 
 /**
  * D1 数据访问层只暴露 Renewlet 产品语义。
@@ -35,7 +41,7 @@ const userColumnNames = [
   "updated_at",
 ] as const;
 
-const subscriptionColumnNames = [
+export const SUBSCRIPTION_COLUMN_NAMES = [
   "id",
   "user_id",
   "name",
@@ -71,6 +77,32 @@ const subscriptionColumnNames = [
   "created_at",
   "updated_at",
 ] as const;
+
+export const SUBSCRIPTION_COLLECTION_COLUMN_NAMES = [
+  "id",
+  "name",
+  "logo",
+  "price",
+  "currency",
+  "billing_cycle",
+  "custom_days",
+  "custom_cycle_unit",
+  "one_time_term_count",
+  "one_time_term_unit",
+  "category",
+  "status",
+  "pinned",
+  "public_hidden",
+  "payment_method",
+  "start_date",
+  "next_billing_date",
+  "auto_renew",
+  "auto_calculate_next_billing_date",
+  "trial_end_date",
+  "reminder_days",
+  "cost_sharing_json",
+  "created_at",
+] as const satisfies readonly (keyof SubscriptionCollectionRow)[];
 
 const assetColumnNames = [
   "id",
@@ -126,7 +158,12 @@ const telegramBotBindingColumnNames = [
 
 export const USER_COLUMNS = userColumnNames.join(", ");
 export const USER_COLUMNS_FROM_USERS = userColumnNames.map((column) => `users.${column} AS ${column}`).join(", ");
-export const SUBSCRIPTION_COLUMNS = subscriptionColumnNames.join(", ");
+export const SUBSCRIPTION_COLUMNS = SUBSCRIPTION_COLUMN_NAMES.join(", ");
+export const SUBSCRIPTION_COLLECTION_COLUMNS = SUBSCRIPTION_COLLECTION_COLUMN_NAMES.join(", ");
+
+export function subscriptionRowValues(row: SubscriptionRow): unknown[] {
+  return SUBSCRIPTION_COLUMN_NAMES.map((column) => row[column]);
+}
 export const ASSET_COLUMNS = assetColumnNames.join(", ");
 export const NOTIFICATION_JOB_COLUMNS = notificationJobColumnNames.join(", ");
 export const API_TOKEN_COLUMNS = apiTokenColumnNames.join(", ");
@@ -249,13 +286,18 @@ export async function ensureSettings(env: Env, userId: string, locale: ApiAppSet
 /** 保存设置前重跑完整 shared schema，确保 D1 写入后的数据仍可被 Go/前端同一契约消费。 */
 export async function putSettings(env: Env, userId: string, settings: ApiAppSettings): Promise<ApiAppSettings> {
   const parsed = appSettingsSchema.parse(settings);
+  await settingsUpsertStatement(env, userId, parsed).run();
+  return parsed;
+}
+
+export function settingsUpsertStatement(env: Env, userId: string, settings: ApiAppSettings): D1PreparedStatement {
+  const parsed = appSettingsSchema.parse(settings);
   const timestamp = nowIso();
-  await env.DB.prepare(`
+  return env.DB.prepare(`
     INSERT INTO settings (user_id, settings_json, created_at, updated_at)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at
-  `).bind(userId, JSON.stringify(parsed), timestamp, timestamp).run();
-  return parsed;
+  `).bind(userId, JSON.stringify(parsed), timestamp, timestamp);
 }
 
 export function normalizeSettingsJson(value: string): ApiAppSettings {
@@ -291,13 +333,9 @@ export async function putCustomConfig(env: Env, userId: string, config: unknown)
   return config;
 }
 
-/** 将 D1 订阅行转换为公开 API 形状；这是 Worker 订阅响应的唯一出站契约门。 */
-export function toApiSubscription(row: SubscriptionRow): ApiSubscription {
-  const tags = parseStringArray(row.tags_json);
+export function toApiSubscriptionCollectionItem(row: SubscriptionCollectionRow): ApiSubscriptionCollectionItem {
   // cost_sharing_json 是 D1 唯一持久化形态，出站必须重新过 shared schema，防止 Worker 与 Docker costSharing 漂移。
   const costSharing = parseJsonObject(row.cost_sharing_json ?? "{}");
-  const extra = parseJsonObject(row.extra_json);
-  // D1 行使用 snake_case/整数布尔；所有出站数据都在这里重新过 shared schema，避免前端和 Worker 分叉。
   const normalized = {
     id: row.id,
     name: row.name,
@@ -316,21 +354,70 @@ export function toApiSubscription(row: SubscriptionRow): ApiSubscription {
     startDate: row.start_date,
     nextBillingDate: row.next_billing_date,
     autoRenew: row.billing_cycle === "one-time" ? false : intToBool(row.auto_renew),
+    autoCalculateNextBillingDate: row.billing_cycle === "one-time"
+      ? false
+      : intToBool(row.auto_calculate_next_billing_date),
+    ...(row.trial_end_date ? { trialEndDate: row.trial_end_date } : {}),
+    reminderDays: row.reminder_days,
+    ...(Object.keys(costSharing).length > 0 ? { costSharing } : {}),
+  };
+  return apiSubscriptionCollectionItemSchema.parse(normalized);
+}
+
+export function toApiSubscription(row: SubscriptionRow): ApiSubscription {
+  const extra = parseJsonObject(row.extra_json);
+  const normalized = {
+    ...toApiSubscriptionCollectionItem(row),
+    ...(row.website ? { website: row.website } : {}),
+    ...(row.notes ? { notes: row.notes } : {}),
+    tags: parseStringArray(row.tags_json),
+    repeatReminderEnabled: intToBool(row.repeat_reminder_enabled),
+    repeatReminderInterval: row.repeat_reminder_interval,
+    repeatReminderWindow: row.repeat_reminder_window,
+    extra,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  return apiSubscriptionSchema.parse(normalized);
+}
+
+export function toPublicApiSubscription(row: SubscriptionRow) {
+  const costSharing = parseJsonObject(row.cost_sharing_json ?? "{}");
+  const extra = parseJsonObject(row.extra_json);
+  return publicApiSubscriptionSchema.parse({
+    id: row.id,
+    name: row.name,
+    ...(row.logo ? { logo: row.logo } : {}),
+    price: moneyFromUnknown(row.price) ?? "0",
+    currency: row.currency,
+    billingCycle: row.billing_cycle,
+    ...(row.custom_days === null ? {} : { customDays: row.custom_days }),
+    ...(row.custom_cycle_unit === null ? {} : { customCycleUnit: row.custom_cycle_unit }),
+    ...(row.one_time_term_count && row.one_time_term_unit
+      ? { oneTimeTermCount: row.one_time_term_count, oneTimeTermUnit: row.one_time_term_unit }
+      : {}),
+    category: row.category,
+    status: row.status,
+    pinned: intToBool(row.pinned),
+    publicHidden: intToBool(row.public_hidden),
+    ...(row.payment_method ? { paymentMethod: row.payment_method } : {}),
+    startDate: row.start_date,
+    nextBillingDate: row.next_billing_date,
+    autoRenew: row.billing_cycle === "one-time" ? false : intToBool(row.auto_renew),
     autoCalculateNextBillingDate: intToBool(row.auto_calculate_next_billing_date),
     ...(row.trial_end_date ? { trialEndDate: row.trial_end_date } : {}),
     ...(row.website ? { website: row.website } : {}),
     ...(row.notes ? { notes: row.notes } : {}),
-    tags,
+    tags: parseStringArray(row.tags_json),
     reminderDays: row.reminder_days,
     repeatReminderEnabled: intToBool(row.repeat_reminder_enabled),
     repeatReminderInterval: row.repeat_reminder_interval,
     repeatReminderWindow: row.repeat_reminder_window,
     ...(Object.keys(costSharing).length > 0 ? { costSharing } : {}),
-    ...(Object.keys(extra).length > 0 ? { extra } : {}),
+    extra,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-  };
-  return apiSubscriptionSchema.parse(normalized);
+  });
 }
 
 export async function getSubscription(env: Env, userId: string, id: string): Promise<SubscriptionRow | null> {
@@ -351,7 +438,9 @@ export async function listSubscriptions(env: Env, userId: string): Promise<Subsc
     const page = await listSubscriptionsPage(env, userId, { limit: 100, cursor });
     rows.push(...page);
     if (page.length < 100) return rows;
-    cursor = subscriptionCursor(page[page.length - 1]!);
+    const last = page.at(-1);
+    if (!last) return rows;
+    cursor = subscriptionCursor(last);
   }
 }
 
@@ -431,7 +520,29 @@ export async function listSubscriptionsPage(
   return result.results;
 }
 
-export function subscriptionCursor(row: SubscriptionRow): string {
+export async function listSubscriptionCollectionPage(
+  env: Env,
+  userId: string,
+  options: { limit: number; cursor?: string | undefined },
+): Promise<SubscriptionCollectionRow[]> {
+  const cursor = parseSubscriptionCursor(options.cursor);
+  const limit = Math.max(1, Math.min(options.limit, 101));
+  if (!cursor) {
+    const result = await env.DB.prepare(`SELECT ${SUBSCRIPTION_COLLECTION_COLUMNS} FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`)
+      .bind(userId, limit)
+      .all<SubscriptionCollectionRow>();
+    return result.results;
+  }
+  const result = await env.DB.prepare(`
+    SELECT ${SUBSCRIPTION_COLLECTION_COLUMNS} FROM subscriptions
+    WHERE user_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+  `).bind(userId, cursor.createdAt, cursor.createdAt, cursor.id, limit).all<SubscriptionCollectionRow>();
+  return result.results;
+}
+
+export function subscriptionCursor(row: Pick<SubscriptionRow, "created_at" | "id">): string {
   return btoa(JSON.stringify({ createdAt: row.created_at, id: row.id }));
 }
 

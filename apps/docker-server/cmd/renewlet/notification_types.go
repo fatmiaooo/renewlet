@@ -14,7 +14,6 @@ import (
 )
 
 const (
-	notificationStatusPending = "pending"
 	notificationStatusSending = "sending"
 	notificationStatusSent    = "sent"
 	notificationStatusFailed  = "failed"
@@ -314,10 +313,9 @@ type notificationHistoryPageResponse struct {
 	HasMore bool                     `json:"hasMore"`
 }
 
-type notificationHistoryResponse struct {
+type notificationOverviewResponse struct {
 	Summary  notificationHistorySummaryResponse `json:"summary"`
 	Upcoming []upcomingNotificationBatch        `json:"upcoming"`
-	History  notificationHistoryPageResponse    `json:"history"`
 }
 
 type notificationJobResultSettings struct {

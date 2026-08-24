@@ -1,7 +1,14 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
-import { afterEach, vi } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
 import { EXPLICIT_LOCALE_PREFERENCE_KEY } from "@/i18n/locales";
+import { activateLoadedLocale, loadLocaleCatalog } from "@/i18n/messages";
+
+const [zhCNMessages] = await Promise.all([
+  loadLocaleCatalog("zh-CN"),
+  loadLocaleCatalog("en-US"),
+]);
+activateLoadedLocale("zh-CN", zhCNMessages);
 
 class ResizeObserverMock {
   observe() {}
@@ -47,6 +54,22 @@ function installStorage(name: "localStorage" | "sessionStorage") {
   });
 }
 
+function formatConsoleValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.stack ?? value.message;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function rejectUnexpectedConsoleCall(level: "warn" | "error") {
+  return (...values: unknown[]): never => {
+    throw new Error(`Unexpected console.${level}: ${values.map(formatConsoleValue).join(" ")}`);
+  };
+}
+
 // 组件库依赖 ResizeObserver/scrollIntoView，但单测只验证 React 状态和可访问输出，不需要真实布局引擎。
 vi.stubGlobal("ResizeObserver", ResizeObserverMock);
 installStorage("localStorage");
@@ -63,6 +86,12 @@ if (!Element.prototype.setPointerCapture) {
 if (!Element.prototype.releasePointerCapture) {
   Element.prototype.releasePointerCapture = vi.fn();
 }
+
+beforeEach(() => {
+  // 预期故障日志必须由对应测试局部接管并断言；其余 React、Radix 或业务告警都属于回归。
+  vi.spyOn(console, "warn").mockImplementation(rejectUnexpectedConsoleCall("warn"));
+  vi.spyOn(console, "error").mockImplementation(rejectUnexpectedConsoleCall("error"));
+});
 
 afterEach(() => {
   cleanup();

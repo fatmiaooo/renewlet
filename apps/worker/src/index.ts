@@ -37,12 +37,23 @@ import {
   deleteCalendarFeed,
   deleteSubscriptionCalendarFeed,
   downloadSubscriptionCalendarIcs,
+  listSubscriptionCalendarFeeds,
   readCalendarFeed,
   readSubscriptionCalendarFeed,
+  rotateCalendarFeed,
+  rotateSubscriptionCalendarFeed,
 } from "./calendar-feed";
 import { readCustomConfig, readSettings, updateCustomConfig, updateSettings } from "./settings";
 import { putExchangeRateSnapshot, readExchangeRateSnapshots } from "./exchange-rate-snapshots";
 import { createSubscription, deleteSubscription, readSubscriptions, renewSubscription, updateSubscription } from "./subscriptions";
+import {
+  readSubscriptionAnalytics,
+  readSubscriptionCalendar,
+  readSubscriptionDetail,
+  readSubscriptionExport,
+  readSubscriptionFacets,
+  readSubscriptionIndex,
+} from "./subscription-collections";
 import { applyImport, previewImport } from "./import-export";
 import {
   createCloudBackup,
@@ -63,7 +74,7 @@ import {
 } from "./media-icon-index";
 import { consumeBuiltInIconIndexRefreshQueue } from "./media-icon-index-refresh-queue";
 import { mediaCandidates } from "./search";
-import { notificationHistory, notificationRun, notificationTest, runScheduledNotifications } from "./notifications";
+import { notificationHistory, notificationOverview, notificationRun, notificationTest, runScheduledNotifications } from "./notifications";
 import { renewAutoSubscriptionsForAllUsers } from "./subscription-renewal";
 import {
   createPublicStatusPage,
@@ -105,6 +116,11 @@ type AppContext = Context<AppBindings>;
 type AppRouter = Hono<AppBindings>;
 type RouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 type RouteHandler = (context: AppContext) => Response | Promise<Response>;
+
+export interface RuntimeRouteManifestEntry {
+  path: string;
+  methods: RouteMethod[];
+}
 
 /**
  * Cloudflare Worker 入口。
@@ -245,10 +261,20 @@ defineRoute(subscriptionRoutes, "/", {
   GET: (context) => readSubscriptions(context.req.raw, context.env),
   POST: (context) => createSubscription(context.req.raw, context.env),
 });
+// 集合静态路由先于 /:id 注册，避免 Hono 把 index/analytics/calendar-feeds/facets/export 当作订阅 ID。
+defineRoute(subscriptionRoutes, "/index", { GET: (context) => readSubscriptionIndex(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/analytics", { GET: (context) => readSubscriptionAnalytics(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/calendar", { GET: (context) => readSubscriptionCalendar(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/calendar-feeds", { GET: (context) => listSubscriptionCalendarFeeds(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/facets", { GET: (context) => readSubscriptionFacets(context.req.raw, context.env) });
+defineRoute(subscriptionRoutes, "/export", { GET: (context) => readSubscriptionExport(context.req.raw, context.env) });
 defineRoute(subscriptionRoutes, "/:id/calendar-feed", {
   GET: (context) => readSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
   POST: (context) => createSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
   DELETE: (context) => deleteSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
+});
+defineRoute(subscriptionRoutes, "/:id/calendar-feed/rotate", {
+  POST: (context) => rotateSubscriptionCalendarFeed(context.req.raw, context.env, routeParam(context, "id")),
 });
 defineRoute(subscriptionRoutes, "/:id/calendar.ics", {
   GET: (context) => downloadSubscriptionCalendarIcs(context.req.raw, context.env, routeParam(context, "id")),
@@ -257,6 +283,7 @@ defineRoute(subscriptionRoutes, "/:id/renew", {
   POST: (context) => renewSubscription(context.req.raw, context.env, routeParam(context, "id")),
 });
 defineRoute(subscriptionRoutes, "/:id", {
+  GET: (context) => readSubscriptionDetail(context.req.raw, context.env, routeParam(context, "id")),
   PATCH: (context) => updateSubscription(context.req.raw, context.env, routeParam(context, "id")),
   DELETE: (context) => deleteSubscription(context.req.raw, context.env, routeParam(context, "id")),
 });
@@ -302,7 +329,9 @@ defineRoute(app, "/api/app/calendar-feed", {
   POST: (context) => createCalendarFeed(context.req.raw, context.env),
   DELETE: (context) => deleteCalendarFeed(context.req.raw, context.env),
 });
-
+defineRoute(app, "/api/app/calendar-feed/rotate", {
+  POST: (context) => rotateCalendarFeed(context.req.raw, context.env),
+});
 defineRoute(app, "/api/app/public-status-page", {
   GET: (context) => readPublicStatusPage(context.req.raw, context.env),
   POST: (context) => createPublicStatusPage(context.req.raw, context.env),
@@ -311,6 +340,7 @@ defineRoute(app, "/api/app/public-status-page", {
 });
 
 defineRoute(app, "/api/app/notifications/history", { GET: (context) => notificationHistory(context.req.raw, context.env) });
+defineRoute(app, "/api/app/notifications/overview", { GET: (context) => notificationOverview(context.req.raw, context.env) });
 defineRoute(app, "/api/app/notifications/test", { POST: (context) => notificationTest(context.req.raw, context.env) });
 defineRoute(app, "/api/app/notifications/run", { POST: (context) => notificationRun(context.req.raw, context.env) });
 defineRoute(app, "/api/app/media/candidates", { POST: (context) => mediaCandidates(context.req.raw, context.env) });
@@ -343,7 +373,7 @@ function routeParam(context: AppContext, name: string): string {
 }
 
 /**
- * defineRoute 保留旧 routeMethods 的同路径 405 语义；Hono 负责匹配，业务 handler 仍只拿原始 Request/Env。
+ * defineRoute 集中维护同路径 405 语义；Hono 负责匹配，业务 handler 仍只拿原始 Request/Env。
  */
 function defineRoute(router: AppRouter, path: string, handlers: Partial<Record<RouteMethod, RouteHandler>>): void {
   if (handlers.GET) router.get(path, handlers.GET);
@@ -352,6 +382,31 @@ function defineRoute(router: AppRouter, path: string, handlers: Partial<Record<R
   if (handlers.PATCH) router.patch(path, handlers.PATCH);
   if (handlers.DELETE) router.delete(path, handlers.DELETE);
   router.all(path, (context) => methodNotAllowed(context.get("locale") ?? requestLocale(context.req.raw)));
+}
+
+/** 从 Hono 已注册 routes 导出产品契约；ALL fallback、scheduled 和 queue 不属于 HTTP route manifest。 */
+export function workerProductRouteManifest(): RuntimeRouteManifestEntry[] {
+  const methodsByPath = new Map<string, Set<RouteMethod>>();
+  for (const route of app.routes) {
+    const method = route.method.toUpperCase();
+    if (!isRouteMethod(method)) continue;
+    const path = normalizeRuntimeRoutePath(route.path);
+    const methods = methodsByPath.get(path) ?? new Set<RouteMethod>();
+    methods.add(method);
+    methodsByPath.set(path, methods);
+  }
+  return [...methodsByPath.entries()]
+    .map(([path, methods]) => ({ path, methods: [...methods].sort() }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function isRouteMethod(method: string): method is RouteMethod {
+  return method === "GET" || method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+function normalizeRuntimeRoutePath(path: string): string {
+  const normalized = `/${path.trim().replace(/^\/+|\/+$/g, "")}`.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
+  return normalized === "/" ? normalized : normalized.replace(/\/$/, "");
 }
 
 async function runScheduledTasks(env: Env): Promise<void> {

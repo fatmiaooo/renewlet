@@ -2,8 +2,17 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createDefaultAppSettings } from "@renewlet/shared/settings-defaults";
+import {
+  apiTokenCreatePayloadSchema,
+  publicApiDuePayloadSchema,
+  publicApiMePayloadSchema,
+  publicApiStatusPayloadSchema,
+  publicApiSubscriptionPayloadSchema,
+  publicApiSubscriptionsListPayloadSchema,
+} from "@renewlet/shared/schemas/public-api";
 import { describe, expect, it, vi } from "vitest";
 import { readSuccessData } from "./api-test-helpers";
+import { countSubscriptionStatuses } from "./subscription-derived-state";
 import { dateOnlyInZone } from "./subscription-renewal";
 import { sha256 } from "./crypto";
 import {
@@ -104,28 +113,18 @@ class PublicApiTestStatement {
       const [userId, id] = this.values as [string, string];
       return this.state.subscriptions.find((row) => row.user_id === userId && row.id === id) as T | undefined ?? null;
     }
-    if (this.sql.includes("SELECT COUNT(*) AS count") && this.sql.includes("FROM subscriptions")) {
-      const userId = String(this.values[0]);
-      const rows = this.state.subscriptions.filter((row) => row.user_id === userId);
-      return {
-        count: rows.length,
-        source_updated_at: rows.reduce((max, row) => row.updated_at > max ? row.updated_at : max, ""),
-      } as T;
-    }
-    if (this.sql.includes("COUNT(*) AS count FROM subscription_list_index")) {
-      const userId = String(this.values[0]);
-      return { count: this.state.subscriptions.filter((row) => row.user_id === userId).length } as T;
-    }
     if (this.sql.includes("FROM subscription_user_stats")) {
       const userId = String(this.values[0]);
-      const statusCounts: Record<string, number> = { active: 0, trial: 0, paused: 0, cancelled: 0, expired: 0 };
       const rows = this.state.subscriptions.filter((row) => row.user_id === userId);
-      for (const row of rows) statusCounts[row.status] = (statusCounts[row.status] ?? 0) + 1;
+      const statusCounts = countSubscriptionStatuses(rows);
       return {
         user_id: userId,
         total_count: rows.length,
-        status_counts_json: JSON.stringify(statusCounts),
-        source_updated_at: rows.reduce((max, row) => row.updated_at > max ? row.updated_at : max, ""),
+        trial_count: statusCounts.trial,
+        active_count: statusCounts.active,
+        expired_count: statusCounts.expired,
+        paused_count: statusCounts.paused,
+        cancelled_count: statusCounts.cancelled,
         created_at: "2026-06-01T00:00:00.000Z",
         updated_at: "2026-06-01T00:00:00.000Z",
       } as T;
@@ -143,14 +142,6 @@ class PublicApiTestStatement {
         .filter((row) => row.user_id === userId)
         .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
       return d1Result(rows as T[]);
-    }
-    if (this.sql.includes("FROM subscriptions") && this.sql.includes("GROUP BY status")) {
-      const userId = String(this.values[0]);
-      const counts = new Map<string, number>();
-      for (const row of this.state.subscriptions.filter((item) => item.user_id === userId)) {
-        counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
-      }
-      return d1Result(Array.from(counts, ([status, count]) => ({ status, count })) as T[]);
     }
     if (this.sql.includes("FROM subscriptions") && this.sql.includes("next_billing_date >= ?")) {
       const [userId, today, through] = this.values as [string, string, string, string, string];
@@ -366,7 +357,7 @@ describe("Cloudflare Public API", () => {
     }), env);
     expect(createResponse.status).toBe(201);
     expect(createResponse.headers.get("cache-control")).toBe("no-store");
-    const created = await readSuccessData<{ token: { id: string; tokenPrefix: string }; plainToken: string }>(createResponse);
+    const created = apiTokenCreatePayloadSchema.parse(await readSuccessData<unknown>(createResponse));
     expect(created.plainToken).toBe(PLAIN_TOKEN);
     expect(created.token.tokenPrefix).toBe(PLAIN_TOKEN.slice(0, 12));
     expect(env.__state.apiTokens).toHaveLength(1);
@@ -388,34 +379,38 @@ describe("Cloudflare Public API", () => {
     expect(meResponse.status).toBe(200);
     expect(meResponse.headers.get("cache-control")).toBe("no-store");
     expect(env.__state.apiTokens[0]?.last_used_at).toBeTruthy();
-    expect(await readSuccessData<{ scopes: string[] }>(meResponse)).toEqual({ scopes: ["read"] });
+    expect(publicApiMePayloadSchema.parse(await readSuccessData<unknown>(meResponse))).toEqual({ scopes: ["read"] });
 
     const subscriptionsResponse = await publicApiSubscriptions(publicRequest("/api/public/v1/subscriptions?limit=1"), env);
-    const subscriptionsBody = await readSuccessData<{ subscriptions: Array<Record<string, unknown>>; nextCursor: string | null; total: number }>(subscriptionsResponse);
+    const subscriptionsBody = publicApiSubscriptionsListPayloadSchema.parse(await readSuccessData<unknown>(subscriptionsResponse));
     expect(subscriptionsBody.total).toBe(3);
     expect(subscriptionsBody.subscriptions).toHaveLength(1);
     expect(subscriptionsBody.nextCursor).toEqual(expect.any(String));
     expect(subscriptionsBody.subscriptions[0]).not.toHaveProperty("user");
 
     const allSubscriptionsResponse = await publicApiSubscriptions(publicRequest("/api/public/v1/subscriptions?limit=3"), env);
-    const allSubscriptionsBody = await readSuccessData<{ subscriptions: Array<Record<string, unknown>> }>(allSubscriptionsResponse);
-    expect(allSubscriptionsBody.subscriptions.find((item) => item["id"] === "sub_renewal")).toMatchObject({ startDate: null });
+    const allSubscriptionsBody = publicApiSubscriptionsListPayloadSchema.parse(await readSuccessData<unknown>(allSubscriptionsResponse));
+    expect(allSubscriptionsBody.subscriptions.find((item) => item.id === "sub_renewal")).toMatchObject({ startDate: null });
+    expect(allSubscriptionsBody.subscriptions.find((item) => item.id === "sub_expiry")).toMatchObject({
+      autoCalculateNextBillingDate: true,
+    });
+    expect(allSubscriptionsBody.subscriptions.find((item) => item.id === "sub_renewal")).toMatchObject({ extra: {} });
 
     const detailResponse = await publicApiSubscription(publicRequest("/api/public/v1/subscriptions/sub_renewal"), env, "sub_renewal");
-    expect(await readSuccessData<{ subscription: Record<string, unknown> }>(detailResponse)).toMatchObject({
+    expect(publicApiSubscriptionPayloadSchema.parse(await readSuccessData<unknown>(detailResponse))).toMatchObject({
       subscription: { id: "sub_renewal", name: "Renewal Plan", startDate: null },
     });
     await expect(publicApiSubscription(publicRequest("/api/public/v1/subscriptions/sub_other"), env, "sub_other"))
       .rejects.toMatchObject({ status: 404 });
 
     const statusResponse = await publicApiStatus(publicRequest("/api/public/v1/status"), env);
-    expect(await readSuccessData<Record<string, unknown>>(statusResponse)).toMatchObject({
+    expect(publicApiStatusPayloadSchema.parse(await readSuccessData<unknown>(statusResponse))).toMatchObject({
       total: 3,
       byStatus: { active: 2, trial: 1, expired: 0, paused: 0, cancelled: 0 },
     });
 
     const dueResponse = await publicApiDue(publicRequest("/api/public/v1/due?days=30"), env);
-    const dueBody = await readSuccessData<{ items: Array<{ dueType: string; subscription: { id: string; startDate: string | null } }> }>(dueResponse);
+    const dueBody = publicApiDuePayloadSchema.parse(await readSuccessData<unknown>(dueResponse));
     expect(dueBody.items.map((item) => [item.subscription.id, item.dueType])).toEqual(expect.arrayContaining([
       ["sub_renewal", "renewal"],
       ["sub_trial", "trial"],

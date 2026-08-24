@@ -42,19 +42,28 @@ import type { PublicStatusResponse } from "@/lib/api/schemas/public-status";
 import { CYCLE_LABELS } from "@/types/subscription";
 import type { ThemeMode } from "@/types/theme";
 import { moneyToNumber } from "@renewlet/shared/money";
+import { requireCustomBillingCycle } from "@renewlet/shared/subscription-renewal";
 
 type PublicStatusSubscription = PublicStatusResponse["subscriptions"][number];
 type PublicStatusExchangeRateBasis = NonNullable<PublicStatusResponse["page"]["exchangeRateBasis"]>;
 type PublicStatusCurrencyConverter = (amount: number | string, fromCurrency: string, toCurrency: string) => number;
 
-const PUBLIC_STATUS_THEME_OPTIONS: Array<{
+interface PublicStatusThemeOption {
   value: ThemeMode;
   labelKey: MessageKey;
   Icon: LucideIcon;
-}> = [
+}
+
+const SYSTEM_PUBLIC_STATUS_THEME_OPTION: PublicStatusThemeOption = {
+  value: "system",
+  labelKey: "theme.system",
+  Icon: Monitor,
+};
+
+const PUBLIC_STATUS_THEME_OPTIONS: PublicStatusThemeOption[] = [
   { value: "light", labelKey: "theme.light", Icon: Sun },
   { value: "dark", labelKey: "theme.dark", Icon: Moon },
-  { value: "system", labelKey: "theme.system", Icon: Monitor },
+  SYSTEM_PUBLIC_STATUS_THEME_OPTION,
 ];
 
 function useNoIndexMeta() {
@@ -102,12 +111,12 @@ function PublicStatusLoading() {
           <Skeleton className="h-8 w-36" />
           <Skeleton className="mt-2 h-4 w-64 max-w-full" />
         </div>
-        <div className="grid gap-5 [grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr))]">
+        <div className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))]">
           {Array.from({ length: 4 }, (_, index) => (
             <Skeleton key={index} className="h-32 rounded-xl" />
           ))}
         </div>
-        <div className="grid gap-4 [grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr))]">
+        <div className="grid gap-4 grid-cols-[repeat(auto-fit,minmax(min(100%,18rem),1fr))]">
           {Array.from({ length: 6 }, (_, index) => (
             <Skeleton key={index} className="h-44 rounded-xl" />
           ))}
@@ -121,7 +130,7 @@ function PublicStatusThemeMenu() {
   const { theme, setTheme } = useTheme();
   const { t } = useI18n();
   const currentOption = PUBLIC_STATUS_THEME_OPTIONS.find((option) => option.value === theme)
-    ?? PUBLIC_STATUS_THEME_OPTIONS[1]!;
+    ?? SYSTEM_PUBLIC_STATUS_THEME_OPTION;
   const CurrentIcon = currentOption.Icon;
 
   const handleThemeChange = (value: string) => {
@@ -276,7 +285,8 @@ function PublicStatusMoneySummary({ data }: { data: PublicStatusResponse }) {
 function PublicStatusLiveMoneySummary({ data }: { data: PublicStatusResponse }) {
   const { t, formatCurrency, formatNumber } = useI18n();
   const { convert, loading: ratesLoading } = useExchangeRates();
-  const currency = data.page.currency!;
+  const currency = data.page.currency;
+  if (!currency) return null;
   const moneySubtitle = ratesLoading
     ? t("publicStatus.ratesLoading")
     : data.page.exchangeRateBasis?.status === "live"
@@ -309,11 +319,12 @@ function PublicStatusMoneyCards({
 }) {
   const stats = publicStatusStats(data);
   const monthlyTotal = publicStatusMonthlyTotal(data, convert);
-  const currency = data.page.currency!;
+  const currency = data.page.currency;
   const { t } = useI18n();
+  if (!currency) return null;
 
   return (
-    <div className="grid gap-5 [grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr))]">
+    <div className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))]">
       <StatCard
         title={t("publicStatus.monthlyTotal")}
         value={formatCurrency(monthlyTotal, currency)}
@@ -353,11 +364,10 @@ function PublicStatusCountSummary({ data }: { data: PublicStatusResponse }) {
   const stats = publicStatusStats(data);
 
   return (
-    <div className="grid gap-5 [grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr))]">
+    <div className="grid gap-5 grid-cols-[repeat(auto-fit,minmax(min(100%,14rem),1fr))]">
       <StatCard
         title={t("publicStatus.visibleCount")}
         value={formatNumber(stats.visible)}
-        subtitle={t("publicStatus.visibleSubtitle")}
         icon={<Eye className="h-6 w-6" />}
         variant="primary"
         className="animate-fade-in"
@@ -365,7 +375,6 @@ function PublicStatusCountSummary({ data }: { data: PublicStatusResponse }) {
       <StatCard
         title={t("publicStatus.activeCount")}
         value={formatNumber(stats.active)}
-        subtitle={t("publicStatus.activeSubtitle")}
         icon={<Activity className="h-6 w-6" />}
         className="animate-fade-in [animation-delay:100ms]"
       />
@@ -391,10 +400,9 @@ function PublicStatusCountSummary({ data }: { data: PublicStatusResponse }) {
 function publicBillingCycleLabel(subscription: PublicStatusSubscription, locale: Locale) {
   if (!subscription.billingCycle) return null;
   if (subscription.billingCycle !== "custom") return localizedLabel(CYCLE_LABELS[subscription.billingCycle], locale);
-  const count = subscription.customDays ?? 1;
-  const unit = subscription.customCycleUnit ?? "day";
-  const unitLabel = translate(locale, customCycleUnitLabelKey(unit));
-  return translate(locale, "subscription.customCycleLabel", { count, unit: unitLabel });
+  const custom = requireCustomBillingCycle(subscription.customDays, subscription.customCycleUnit);
+  const unitLabel = translate(locale, customCycleUnitLabelKey(custom.unit));
+  return translate(locale, "subscription.customCycleLabel", { count: custom.count, unit: unitLabel });
 }
 
 function PublicSubscriptionCard({ subscription }: { subscription: PublicStatusSubscription }) {
@@ -511,10 +519,9 @@ export default function PublicStatusPage() {
               <EyeOff className="h-8 w-8 text-muted-foreground" />
             </div>
             <h2 className="mb-2 text-lg font-medium text-foreground">{t("publicStatus.emptyTitle")}</h2>
-            <p className="text-sm text-muted-foreground">{t("publicStatus.emptyDescription")}</p>
           </div>
         ) : (
-          <section className="grid gap-4 [grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr))]" aria-label={t("publicStatus.listLabel")}>
+          <section className="grid gap-4 grid-cols-[repeat(auto-fit,minmax(min(100%,18rem),1fr))]" aria-label={t("publicStatus.listLabel")}>
             {data.subscriptions.map((subscription, index) => (
               <div
                 key={`${subscription.name}-${subscription.startDate ?? "unknown"}-${subscription.nextBillingDate}-${index}`}

@@ -95,6 +95,7 @@ describe("Cloudflare D1 subscription migrations", () => {
         billingCycle: "monthly",
       });
       applyMigration(db, "0035_rebuild_cost_sharing_collection_reminder_schema.sql");
+      applyMigration(db, "0036_subscription_derived_state_v2.sql");
 
       const response = await readSubscriptions(new Request("https://renewlet.test/api/app/subscriptions?limit=10"), {
         DB: new SqliteD1Database(db) as unknown as D1Database,
@@ -112,6 +113,123 @@ describe("Cloudflare D1 subscription migrations", () => {
           collectionReminder: { enabled: true, reminderDays: 1 },
         },
       });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("migrates derived stats to fixed columns and creates the repeat backfill boundary", () => {
+    const db = openSubscriptionMigrationDatabase();
+    try {
+      insertCostSharingSubscription(db, {
+        costSharingJson: JSON.stringify(costSharingJson({})),
+        billingCycle: "monthly",
+      });
+      applyMigration(db, "0034_cost_sharing_collection_reminders.sql");
+      applyMigration(db, "0035_rebuild_cost_sharing_collection_reminder_schema.sql");
+
+      applyMigration(db, "0036_subscription_derived_state_v2.sql");
+
+      expect(tableColumnNames(db, "subscription_user_stats")).toEqual([
+        "user_id",
+        "total_count",
+        "trial_count",
+        "active_count",
+        "expired_count",
+        "paused_count",
+        "cancelled_count",
+        "created_at",
+        "updated_at",
+      ]);
+      expect(db.prepare(`
+        SELECT total_count, trial_count, active_count, expired_count, paused_count, cancelled_count
+        FROM subscription_user_stats WHERE user_id = ?
+      `).get(USER_ID)).toEqual({
+        total_count: 1,
+        trial_count: 0,
+        active_count: 1,
+        expired_count: 0,
+        paused_count: 0,
+        cancelled_count: 0,
+      });
+      expect(tableColumnNames(db, "subscription_repeat_schedule")).toEqual([
+        "user_id",
+        "subscription_id",
+        "next_due_at_utc",
+      ]);
+      expect(readIndexSql(db, "idx_subscription_repeat_schedule_due")).toContain(
+        "user_id, next_due_at_utc, subscription_id",
+      );
+      expect(tableColumnNames(db, "subscription_derived_backfills")).toEqual(["name", "completed_at"]);
+      expect(readScalar<number>(db, "SELECT COUNT(*) FROM subscription_derived_backfills")).toBe(0);
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("moves legacy custom units into a one-time migration instead of runtime fallbacks", () => {
+    const db = openSubscriptionMigrationDatabase();
+    try {
+      insertCostSharingSubscription(db, {
+        costSharingJson: JSON.stringify(costSharingJson({})),
+        billingCycle: "custom",
+        customDays: 45,
+        customCycleUnit: null,
+      });
+
+      applyMigration(db, "0037_subscription_cycle_fields.sql");
+
+      expect(db.prepare("SELECT custom_days, custom_cycle_unit FROM subscriptions LIMIT 1").get()).toEqual({
+        custom_days: 45,
+        custom_cycle_unit: "day",
+      });
+
+      db.prepare(`UPDATE subscriptions
+        SET billing_cycle = 'monthly', custom_days = 30, custom_cycle_unit = 'week',
+            one_time_term_count = 6, one_time_term_unit = 'month'`).run();
+      applyMigration(db, "0037_subscription_cycle_fields.sql");
+
+      expect(db.prepare(`SELECT custom_days, custom_cycle_unit,
+        one_time_term_count, one_time_term_unit FROM subscriptions LIMIT 1`).get()).toEqual({
+        custom_days: null,
+        custom_cycle_unit: null,
+        one_time_term_count: null,
+        one_time_term_unit: null,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("cleans orphan calendar feeds, adds the management index, and preserves subscription cascade", () => {
+    const db = openSubscriptionMigrationDatabase();
+    try {
+      insertCostSharingSubscription(db, {
+        costSharingJson: JSON.stringify(costSharingJson({})),
+        billingCycle: "monthly",
+      });
+      applyMigration(db, "0005_calendar_feeds.sql");
+      db.prepare(`INSERT INTO calendar_feeds
+        (id, user_id, scope, subscription_id, token, created_at, updated_at)
+        VALUES (?, ?, 'subscription', ?, ?, ?, ?)`)
+        .run("cal-valid", USER_ID, "sub_migrated", "v".repeat(43), timestamp, timestamp);
+      db.exec("PRAGMA foreign_keys = OFF");
+      db.prepare(`INSERT INTO calendar_feeds
+        (id, user_id, scope, subscription_id, token, created_at, updated_at)
+        VALUES (?, ?, 'subscription', ?, ?, ?, ?)`)
+        .run("cal-orphan", USER_ID, "sub-missing", "o".repeat(43), timestamp, timestamp);
+      db.exec("PRAGMA foreign_keys = ON");
+
+      applyMigration(db, "0038_calendar_feed_management.sql");
+
+      expect(db.prepare("SELECT id FROM calendar_feeds ORDER BY id").all()).toEqual([{ id: "cal-valid" }]);
+      expect(readIndexSql(db, "idx_calendar_feeds_user_scope_updated_id")).toContain(
+        "user_id, scope, updated_at DESC, id DESC",
+      );
+      db.prepare("DELETE FROM subscriptions WHERE id = ?").run("sub_migrated");
+      expect(readScalar<number>(db, "SELECT COUNT(*) FROM calendar_feeds")).toBe(0);
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       db.close();
     }
@@ -252,7 +370,14 @@ function applyOldCostSharingCollectionReminder0034(db: DatabaseSync): void {
 
 function insertCostSharingSubscription(
   db: DatabaseSync,
-  options: { costSharingJson: string; billingCycle: string; oneTimeTermCount?: number | null; oneTimeTermUnit?: string | null },
+  options: {
+    costSharingJson: string;
+    billingCycle: string;
+    customDays?: number | null;
+    customCycleUnit?: string | null;
+    oneTimeTermCount?: number | null;
+    oneTimeTermUnit?: string | null;
+  },
 ): void {
   db.prepare(`
     INSERT INTO subscriptions (
@@ -269,8 +394,8 @@ function insertCostSharingSubscription(
     "30",
     "USD",
     options.billingCycle,
-    null,
-    null,
+    options.customDays ?? null,
+    options.customCycleUnit ?? null,
     options.oneTimeTermCount ?? null,
     options.oneTimeTermUnit ?? null,
     "streaming",
@@ -318,7 +443,11 @@ function applyMigration(db: DatabaseSync, name: string): void {
 }
 
 function subscriptionColumnNames(db: DatabaseSync): string[] {
-  return db.prepare("PRAGMA table_info(subscriptions)").all().map((row) => String(row["name"]));
+  return tableColumnNames(db, "subscriptions");
+}
+
+function tableColumnNames(db: DatabaseSync, table: string): string[] {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map((row) => String(row["name"]));
 }
 
 function readCostSharingJson(db: DatabaseSync): unknown {

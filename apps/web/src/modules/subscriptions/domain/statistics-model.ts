@@ -17,7 +17,7 @@ import { compareDateOnly, fromPlainDate, isSameMonthDateOnly, todayDateOnlyInTim
 import { DEFAULT_LOCALE, localizedLabel, type Locale } from "@/i18n/locales";
 import { translate } from "@/i18n/messages";
 import type { CustomConfig } from "@/types/config";
-import type { Subscription } from "@/types/subscription";
+import type { SubscriptionCollectionItem } from "@/types/subscription";
 import { addBillingCycles } from "@renewlet/shared/subscription-renewal";
 import { calculateCostSharingSummary } from "@renewlet/shared/cost-sharing";
 import { moneyToNumber } from "@renewlet/shared/money";
@@ -66,7 +66,7 @@ interface StatisticsTrendBucket extends StatisticsTrendDatum {
 }
 
 interface BuildStatisticsModelInput {
-  subscriptions: readonly Subscription[];
+  subscriptions: readonly SubscriptionCollectionItem[];
   config: CustomConfig;
   monthlyBudget: string;
   defaultCurrency: string;
@@ -115,7 +115,7 @@ function sortTrendItems(items: StatisticsTrendItem[]): StatisticsTrendItem[] {
 
 function addTrendItem(
   items: StatisticsTrendItem[],
-  subscription: Subscription,
+  subscription: SubscriptionCollectionItem,
   amount: number,
   occurrenceDate: DateOnly | null,
 ) {
@@ -147,13 +147,16 @@ function addTrendItem(
 function addCashflowTrend(
   bucketsByMonth: Map<string, StatisticsTrendBucket>,
   buckets: readonly StatisticsTrendBucket[],
-  subscription: Subscription,
+  subscription: SubscriptionCollectionItem,
   amountInDefault: number,
 ) {
   if (subscription.billingCycle === "one-time" || buckets.length === 0) return;
 
-  const windowStart = buckets[0]!.startDate;
-  const windowEnd = buckets[buckets.length - 1]!.endDate;
+  const firstBucket = buckets.at(0);
+  const lastBucket = buckets.at(-1);
+  if (!firstBucket || !lastBucket) return;
+  const windowStart = firstBucket.startDate;
+  const windowEnd = lastBucket.endDate;
   let dueDate: DateOnly = subscription.nextBillingDate;
 
   // autoRenew 只控制 Renewlet 是否后台推进日期，不代表第三方账单会停止；趋势按当前周期配置预测未来扣费。
@@ -171,8 +174,8 @@ function addCashflowTrend(
       subscription.billingCycle,
       1,
       subscription.customDays,
-      subscription.customCycleUnit ?? "day",
-    ) as DateOnly;
+      subscription.customCycleUnit,
+    );
     if (compareDateOnly(nextDueDate, dueDate) <= 0) break;
     dueDate = nextDueDate;
   }
@@ -180,7 +183,7 @@ function addCashflowTrend(
 
 function addAmortizedTrend(
   buckets: readonly StatisticsTrendBucket[],
-  subscription: Subscription,
+  subscription: SubscriptionCollectionItem,
   monthlyAmount: number,
 ) {
   if (monthlyAmount <= 0) return;
@@ -208,12 +211,12 @@ function addAmortizedTrend(
 }
 
 function buildTrendData(
-  activeSubscriptions: readonly Subscription[],
+  activeSubscriptions: readonly SubscriptionCollectionItem[],
   today: DateOnly,
   locale: Locale,
   convertToDefault: (amount: number | string, currency: string) => number,
-  amountForStats: (subscription: Subscription) => number | string,
-  calculateMonthlyAmount: (subscription: Subscription) => number,
+  amountForStats: (subscription: SubscriptionCollectionItem) => number | string,
+  calculateMonthlyAmount: (subscription: SubscriptionCollectionItem) => number,
 ): StatisticsTrendDatum[] {
   const buckets = buildTrendBuckets(today, locale);
   const bucketsByMonth = new Map(buckets.map((bucket) => [bucket.monthKey, bucket]));
@@ -256,7 +259,7 @@ export function buildStatisticsModel({
   const monthlyBudgetAmount = moneyToNumber(monthlyBudget);
 
   // costBasis 是统计页的金额口径开关；一旦选 personal，月均、当月现金流、分类和趋势都必须使用个人份额。
-  const amountForStats = (subscription: Subscription): number | string =>
+  const amountForStats = (subscription: SubscriptionCollectionItem): number | string =>
     costBasis === "personal"
       ? calculateCostSharingSummary(subscription.costSharing, subscription.price, {
           baseCurrency: subscription.currency,
@@ -264,7 +267,7 @@ export function buildStatisticsModel({
         }).yourShare
       : subscription.price;
   const convertToDefault = (amount: number | string, currency: string) => convert(amount, currency, defaultCurrency);
-  const calculateMonthlyAmount = (subscription: Subscription): number => {
+  const calculateMonthlyAmount = (subscription: SubscriptionCollectionItem): number => {
     // 先换算币种再折算周期，保证所有图表都以用户当前统计货币为唯一口径。
     const amountInDefault = convertToDefault(amountForStats(subscription), subscription.currency);
     return toMonthlyAmount(
@@ -280,12 +283,12 @@ export function buildStatisticsModel({
   const totalMonthly = activeSubscriptions.reduce((sum, subscription) => sum + calculateMonthlyAmount(subscription), 0);
   const totalAnnual = totalMonthly * 12;
   const avgMonthlyPerSub = activeSubscriptions.length > 0 ? totalMonthly / activeSubscriptions.length : 0;
-  const mostExpensive = activeSubscriptions.reduce((max, subscription) => {
+  const mostExpensive = activeSubscriptions.reduce<SubscriptionCollectionItem | null>((max, subscription) => {
     // 使用月折算金额比较，而不是原始价格，避免年付订阅被低估。
     const currentMonthly = calculateMonthlyAmount(subscription);
     const maxMonthly = max ? calculateMonthlyAmount(max) : 0;
     return currentMonthly > maxMonthly ? subscription : max;
-  }, null as Subscription | null);
+  }, null);
   const thisMonthDue = activeSubscriptions
     .filter((subscription) => subscription.billingCycle !== "one-time" && isSameMonthDateOnly(subscription.nextBillingDate, today))
     .reduce((sum, subscription) => sum + convertToDefault(amountForStats(subscription), subscription.currency), 0);
@@ -302,13 +305,14 @@ export function buildStatisticsModel({
       acc[subscription.category] = (acc[subscription.category] || 0) + amount;
       return acc;
     }, {} as Record<string, number>),
-  ).map(([name, value], index) => ({
-    name: categoryByValue.get(name)
-      ? localizedLabel(categoryByValue.get(name)!.labels, locale)
-      : name,
-    value: Math.round(value * 1000) / 1000,
-    color: categoryByValue.get(name)?.color ?? chartColorAt(index),
-  }));
+  ).map(([name, value], index) => {
+    const category = categoryByValue.get(name);
+    return {
+      name: category ? localizedLabel(category.labels, locale) : name,
+      value: Math.round(value * 1000) / 1000,
+      color: category?.color ?? chartColorAt(index),
+    };
+  });
 
   const paymentData = Object.entries(
     activeSubscriptions.reduce((acc, subscription) => {
@@ -316,13 +320,14 @@ export function buildStatisticsModel({
       acc[method] = (acc[method] || 0) + 1;
       return acc;
     }, {} as Record<string, number>),
-  ).map(([name, value], index) => ({
-    name: paymentMethodByValue.get(name)
-      ? localizedLabel(paymentMethodByValue.get(name)!.labels, locale)
-      : name,
-    value,
-    color: chartColorAt(index),
-  }));
+  ).map(([name, value], index) => {
+    const paymentMethod = paymentMethodByValue.get(name);
+    return {
+      name: paymentMethod ? localizedLabel(paymentMethod.labels, locale) : name,
+      value,
+      color: chartColorAt(index),
+    };
+  });
 
   const budgetChartData = [
     { name: translate(locale, "statistics.budgetUsed"), value: Math.min(totalMonthly, monthlyBudgetAmount), color: "hsl(350 75% 55%)" },

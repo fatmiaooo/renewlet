@@ -8,7 +8,7 @@ import {
   type CustomCycleUnit,
   type DateOnly,
 } from "./runtime";
-import { addBillingCycles } from "./subscription-renewal";
+import { addBillingCycles, requireCustomBillingCycle } from "./subscription-renewal";
 
 export const COST_SHARING_SPLIT_MODES = ["equal", "custom"] as const;
 const MAX_COST_SHARING_COLLECTION_ADVANCE_CYCLES = 20_000;
@@ -143,8 +143,9 @@ export function calculateCostSharingSummary(
   }
 
   // 当前用户不在 members 里：equal 按“我 + 成员”平分，custom 则把成员金额直接视作应收款，允许超过订阅总价。
+  const firstMember = costSharing.members.at(0);
   const memberTotal = costSharing.splitMode === "equal"
-    ? roundMoney(Math.max(numericTotal - calculateCostSharingMemberAmount(costSharing, costSharing.members[0]!, total, options), 0))
+    ? roundMoney(Math.max(numericTotal - (firstMember ? calculateCostSharingMemberAmount(costSharing, firstMember, total, options) : 0), 0))
     : roundMoney(costSharing.members.reduce(
         (sum, member) => sum + calculateCostSharingMemberAmount(costSharing, member, total, options),
         0,
@@ -252,7 +253,7 @@ export function nextCostSharingCollectionTargetDate(
       input.billingCycle,
       cycleCount,
       input.customDays,
-      input.customCycleUnit ?? "day",
+      input.customCycleUnit,
     );
     if (compareDateOnly(candidate, input.referenceDate) >= 0) return candidate;
     cycleCount += 1;
@@ -321,9 +322,9 @@ function initialCostSharingCollectionCycleCount(
 function costSharingCollectionExactDayStep(input: Pick<CostSharingCollectionReminderCalculationInput, "billingCycle" | "customDays" | "customCycleUnit">): number | null {
   if (input.billingCycle === "weekly") return 7;
   if (input.billingCycle !== "custom") return null;
-  const count = Math.max(1, Math.trunc(input.customDays ?? 30));
-  if ((input.customCycleUnit ?? "day") === "day") return count;
-  if (input.customCycleUnit === "week") return count * 7;
+  const custom = requireCustomBillingCycle(input.customDays, input.customCycleUnit);
+  if (custom.unit === "day") return custom.count;
+  if (custom.unit === "week") return custom.count * 7;
   return null;
 }
 
@@ -338,9 +339,9 @@ function costSharingCollectionMonthStep(input: Pick<CostSharingCollectionReminde
     case "annual":
       return 12;
     case "custom": {
-      const count = Math.max(1, Math.trunc(input.customDays ?? 30));
-      if (input.customCycleUnit === "month") return count;
-      if (input.customCycleUnit === "year") return count * 12;
+      const custom = requireCustomBillingCycle(input.customDays, input.customCycleUnit);
+      if (custom.unit === "month") return custom.count;
+      if (custom.unit === "year") return custom.count * 12;
       return null;
     }
     default:

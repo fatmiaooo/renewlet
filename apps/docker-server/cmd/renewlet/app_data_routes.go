@@ -22,17 +22,12 @@ import (
 )
 
 type settingsResponse struct {
-	Settings appSettings `json:"settings"`
+	Settings     publicAppSettings                         `json:"settings"`
+	SecretStatus map[string]settingsSecretConfiguredStatus `json:"secretStatus"`
 }
 
 type customConfigResponse struct {
 	Config customConfigPayload `json:"config"`
-}
-
-type subscriptionsListResponse struct {
-	Subscriptions []map[string]interface{} `json:"subscriptions"`
-	NextCursor    *string                  `json:"nextCursor"`
-	Total         int64                    `json:"total,omitempty"`
 }
 
 type subscriptionCursorPayload struct {
@@ -125,7 +120,7 @@ func handleSettingsRead(app core.App, e *core.RequestEvent) error {
 	if err != nil {
 		return e.InternalServerError(serverText(locale, "common.internalError"), err)
 	}
-	return apiSuccessJSON(e, http.StatusOK, settingsResponse{Settings: settings})
+	return apiSuccessJSON(e, http.StatusOK, newSettingsResponse(settings))
 }
 
 func handleSettingsUpdate(app core.App, e *core.RequestEvent) error {
@@ -141,7 +136,7 @@ func handleSettingsUpdate(app core.App, e *core.RequestEvent) error {
 		return e.InternalServerError(serverText(locale, "common.internalError"), err)
 	}
 
-	next, err := mergeSettingsForWrite(current, raw)
+	next, err := mergeSettingsRequest(current, raw)
 	if err != nil {
 		return e.BadRequestError(validationErrorMessage(locale, "common.invalidRequestBody", err), err)
 	}
@@ -154,30 +149,50 @@ func handleSettingsUpdate(app core.App, e *core.RequestEvent) error {
 		}
 		return e.BadRequestError(serverText(locale, "common.invalidRequestParameters"), err)
 	}
-	if record == nil {
-		record, err = createSettingsRecord(app, e.Auth.Id, next)
-		if err != nil {
-			return e.InternalServerError(serverText(locale, "common.internalError"), err)
+	var saved appSettings
+	var validationErr error
+	err = app.RunInTransaction(func(txApp core.App) error {
+		if record == nil {
+			record, err = createSettingsRecord(txApp, e.Auth.Id, next)
+			if err != nil {
+				return err
+			}
+		} else {
+			record.Set("settings", next)
+			if err := txApp.Save(record); err != nil {
+				validationErr = err
+				return err
+			}
 		}
-		if err := refreshCostSharingCollectionReminderMirrorsForUser(app, e.Auth.Id, next, costSharingCollectionReminderReferenceDate(next, time.Now().UTC())); err != nil {
-			return e.InternalServerError(serverText(locale, "common.internalError"), err)
+		if costSharingScheduleSettingsChanged(current, next) {
+			if err := refreshCostSharingCollectionReminderMirrorsForUser(txApp, e.Auth.Id, next, costSharingCollectionReminderReferenceDate(next, time.Now().UTC())); err != nil {
+				return err
+			}
 		}
-		if _, err := refreshSubscriptionSchedulerState(app, e.Auth.Id, false); err != nil {
-			return e.InternalServerError(serverText(locale, "common.internalError"), err)
+		if subscriptionScheduleSettingsChanged(current, next) {
+			if _, err := refreshSubscriptionSchedulerState(txApp, e.Auth.Id, false); err != nil {
+				return err
+			}
 		}
-		return apiSuccessJSON(e, http.StatusOK, settingsResponse{Settings: settingsFromRecord(record)})
-	}
-	record.Set("settings", next)
-	if err := app.Save(record); err != nil {
-		return e.BadRequestError(validationErrorMessage(locale, "common.invalidRequestBody", err), err)
-	}
-	if err := refreshCostSharingCollectionReminderMirrorsForUser(app, e.Auth.Id, next, costSharingCollectionReminderReferenceDate(next, time.Now().UTC())); err != nil {
+		saved = settingsFromRecord(record)
+		return nil
+	})
+	if err != nil {
+		if validationErr != nil {
+			return e.BadRequestError(validationErrorMessage(locale, "common.invalidRequestBody", validationErr), validationErr)
+		}
 		return e.InternalServerError(serverText(locale, "common.internalError"), err)
 	}
-	if _, err := refreshSubscriptionSchedulerState(app, e.Auth.Id, false); err != nil {
-		return e.InternalServerError(serverText(locale, "common.internalError"), err)
-	}
-	return apiSuccessJSON(e, http.StatusOK, settingsResponse{Settings: settingsFromRecord(record)})
+	return apiSuccessJSON(e, http.StatusOK, newSettingsResponse(saved))
+}
+
+func subscriptionScheduleSettingsChanged(before appSettings, after appSettings) bool {
+	return before.NotificationTimeLocal != after.NotificationTimeLocal || costSharingScheduleSettingsChanged(before, after)
+}
+
+func costSharingScheduleSettingsChanged(before appSettings, after appSettings) bool {
+	return before.Timezone != after.Timezone ||
+		before.NotificationReminderDays != after.NotificationReminderDays
 }
 
 func handleCustomConfigRead(app core.App, e *core.RequestEvent) error {
@@ -230,27 +245,6 @@ func handleCustomConfigUpdate(app core.App, e *core.RequestEvent) error {
 		return e.BadRequestError(validationErrorMessage(locale, "common.invalidRequestBody", err), err)
 	}
 	return apiSuccessJSON(e, http.StatusOK, customConfigResponse{Config: body.Config})
-}
-
-func handleSubscriptionsList(app core.App, e *core.RequestEvent) error {
-	locale := requestLocale(e.Request)
-	query, err := parseSubscriptionListQuery(e.Request.URL.Query())
-	if err != nil {
-		return e.BadRequestError(serverText(locale, "common.invalidRequestParameters"), err)
-	}
-	page, err := listSubscriptionRecordsForQuery(app, e.Auth.Id, query, todayDateOnly(time.Now(), currentUserSettingsTimezone(app, e.Auth)))
-	if err != nil {
-		return e.InternalServerError(serverText(locale, "common.internalError"), err)
-	}
-	subscriptions := make([]map[string]interface{}, 0, len(page.Rows))
-	for _, record := range page.Rows {
-		subscriptions = append(subscriptions, subscriptionAPIFromRecord(record))
-	}
-	return apiSuccessJSON(e, http.StatusOK, subscriptionsListResponse{
-		Subscriptions: subscriptions,
-		NextCursor:    page.NextCursor,
-		Total:         page.Total,
-	})
 }
 
 func handleSubscriptionCreate(app core.App, e *core.RequestEvent) error {

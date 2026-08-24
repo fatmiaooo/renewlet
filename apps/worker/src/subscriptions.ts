@@ -12,11 +12,12 @@ import {
   subscriptionsListQuerySchema,
   subscriptionUpdateBodySchema,
 } from "@renewlet/shared/schemas/subscriptions";
-import { boolToInt, getSettings, getSubscription, newId, nowIso, parseJsonObject, parseStringArray, parseSubscriptionCursor, SUBSCRIPTION_COLUMNS, subscriptionCursor, toApiSubscription } from "./db";
+import { boolToInt, getSettings, getSubscription, newId, nowIso, parseJsonObject, parseStringArray, parseSubscriptionCursor, SUBSCRIPTION_COLUMNS, subscriptionCursor, subscriptionRowValues, toApiSubscription, toApiSubscriptionCollectionItem } from "./db";
 import { listSubscriptionsForQuery } from "./subscription-list-filters";
+import { subscriptionCollectionQueryInput } from "./subscription-query";
 import { advanceSubscriptionRenewal, dateOnlyInZone } from "./subscription-renewal";
 import type { SubscriptionRenewalResult } from "@renewlet/shared/subscription-renewal";
-import { refreshSubscriptionDerivedState } from "./subscription-derived-state";
+import { subscriptionDerivedMutationPlan } from "./subscription-derived-state";
 import { HttpError, ok, readJson, requestLocale, successJson } from "./http";
 import { serverText } from "./server-i18n";
 import { requireAuth } from "./auth";
@@ -34,41 +35,20 @@ const subscriptionStorageBodySchema = subscriptionCreateBodySchema.refine((body)
 export async function readSubscriptions(request: Request, env: Env): Promise<Response> {
   const auth = await requireAuth(request, env);
   const url = new URL(request.url);
-  const parsed = subscriptionsListQuerySchema.parse({
-    limit: url.searchParams.get("limit") ?? undefined,
-    cursor: url.searchParams.get("cursor") ?? undefined,
-    q: url.searchParams.get("q") ?? undefined,
-    category: repeatedSearchParam(url.searchParams, "category"),
-    tag: repeatedSearchParam(url.searchParams, "tag"),
-    billingCycle: repeatedSearchParam(url.searchParams, "billingCycle"),
-    paymentMethod: repeatedSearchParam(url.searchParams, "paymentMethod"),
-    currency: repeatedSearchParam(url.searchParams, "currency"),
-    status: url.searchParams.get("status") ?? undefined,
-    renewal: url.searchParams.get("renewal") ?? undefined,
-    nextBillingFrom: url.searchParams.get("nextBillingFrom") ?? undefined,
-    nextBillingTo: url.searchParams.get("nextBillingTo") ?? undefined,
-    pinned: url.searchParams.get("pinned") ?? undefined,
-    publicHidden: url.searchParams.get("publicHidden") ?? undefined,
-    reminderMode: url.searchParams.get("reminderMode") ?? undefined,
-    repeatReminder: url.searchParams.get("repeatReminder") ?? undefined,
-  });
+  const parsed = subscriptionsListQuerySchema.parse(subscriptionCollectionQueryInput(url.searchParams));
   if (parsed.cursor && !parseSubscriptionCursor(parsed.cursor)) {
     throw new HttpError(400, serverText(requestLocale(request), "common.invalidRequestParameters"), "INVALID_CURSOR");
   }
   const today = parsed.status ? dateOnlyInZone(new Date(), (await getSettings(env, auth.user.id)).timezone) : "";
   const page = await listSubscriptionsForQuery(env, auth.user.id, parsed, today);
   const pageRows = page.rows.slice(0, parsed.limit);
-  const nextCursor = page.rows.length > parsed.limit ? subscriptionCursor(pageRows[pageRows.length - 1]!) : null;
+  const lastPageRow = pageRows.at(-1);
+  const nextCursor = page.rows.length > parsed.limit && lastPageRow ? subscriptionCursor(lastPageRow) : null;
   return successJson(subscriptionsListPayloadSchema.parse({
-    subscriptions: pageRows.map(toApiSubscription),
+    subscriptions: pageRows.map(toApiSubscriptionCollectionItem),
     nextCursor,
     total: page.total,
   }));
-}
-
-function repeatedSearchParam(params: URLSearchParams, name: string): string[] | undefined {
-  const values = params.getAll(name);
-  return values.length > 0 ? values : undefined;
 }
 
 /** 新建订阅走 shared create schema，确保 D1 写入边界与 Go/PocketBase API 保持同形。 */
@@ -79,7 +59,7 @@ export async function createSubscription(request: Request, env: Env): Promise<Re
   const timestamp = nowIso();
   const settings = await getSettings(env, auth.user.id);
   const row = toSubscriptionRow(newId("sub"), auth.user.id, body, timestamp, timestamp, { settings });
-  await env.DB.prepare(`
+  const factStatement = env.DB.prepare(`
     INSERT INTO subscriptions (
       id, user_id, name, logo, price, currency, billing_cycle, custom_days, custom_cycle_unit, one_time_term_count, one_time_term_unit,
       category, status, pinned, public_hidden, payment_method,
@@ -87,8 +67,9 @@ export async function createSubscription(request: Request, env: Env): Promise<Re
       reminder_days, repeat_reminder_enabled, repeat_reminder_interval, repeat_reminder_window, cost_sharing_json,
       cost_sharing_collection_reminder_enabled, cost_sharing_next_collection_reminder_date, extra_json, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(...subscriptionRowValues(row)).run();
-  await refreshSubscriptionDerivedState(env, auth.user.id, { resetAutoRenewCheck: true });
+  `).bind(...subscriptionRowValues(row));
+  const derived = subscriptionDerivedMutationPlan(env, { before: null, after: row, kind: "create" }, settings);
+  await env.DB.batch([...derived.beforeFact, factStatement, ...derived.afterFact]);
   return successJson(subscriptionPayloadSchema.parse({ subscription: toApiSubscription(row) }), { status: 201 });
 }
 
@@ -104,7 +85,7 @@ export async function updateSubscription(request: Request, env: Env, id: string)
   // Worker 没有 PocketBase hook 可二次归一；切换计费类型时先清理互斥字段，再合并 patch 走同一套 create schema。
   const mergedBody = parseSubscriptionBodyForStorage(mergeSubscriptionPatchForStorage(toBody(existing), stripUndefined(patch)), locale);
   const merged = toSubscriptionRow(existing.id, auth.user.id, mergedBody, existing.created_at, timestamp, { settings });
-  await env.DB.prepare(`
+  const factStatement = env.DB.prepare(`
     UPDATE subscriptions SET
       name = ?, logo = ?, price = ?, currency = ?, billing_cycle = ?, custom_days = ?, custom_cycle_unit = ?,
       one_time_term_count = ?, one_time_term_unit = ?, category = ?, status = ?,
@@ -147,17 +128,21 @@ export async function updateSubscription(request: Request, env: Env, id: string)
     timestamp,
     auth.user.id,
     id,
-  ).run();
-  await refreshSubscriptionDerivedState(env, auth.user.id, { resetAutoRenewCheck: true });
+  );
+  const derived = subscriptionDerivedMutationPlan(env, { before: existing, after: merged, kind: "update" }, settings);
+  await env.DB.batch([...derived.beforeFact, factStatement, ...derived.afterFact]);
   return successJson(subscriptionPayloadSchema.parse({ subscription: toApiSubscription(merged) }));
 }
 
 export async function deleteSubscription(request: Request, env: Env, id: string): Promise<Response> {
   const locale = requestLocale(request);
   const auth = await requireAuth(request, env);
-  const result = await env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ? AND id = ?").bind(auth.user.id, id).run();
-  if ((result.meta.changes ?? 0) === 0) throw new HttpError(404, serverText(locale, "subscription.notFound"));
-  await refreshSubscriptionDerivedState(env, auth.user.id, { resetAutoRenewCheck: true });
+  const existing = await getSubscription(env, auth.user.id, id);
+  if (!existing) throw new HttpError(404, serverText(locale, "subscription.notFound"));
+  const settings = await getSettings(env, auth.user.id);
+  const derived = subscriptionDerivedMutationPlan(env, { before: existing, after: null, kind: "delete" }, settings);
+  const factStatement = env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ? AND id = ?").bind(auth.user.id, id);
+  await env.DB.batch([...derived.beforeFact, factStatement, ...derived.afterFact]);
   return ok();
 }
 
@@ -177,7 +162,7 @@ export async function renewSubscription(request: Request, env: Env, id: string):
   const timestamp = nowIso();
   // Worker 没有 PocketBase hook；续订也必须先收敛成完整写入 body，才能重新执行 costSharing/date 镜像规则。
   const merged = renewSubscriptionRow(existing, body, result, timestamp, settings, today, locale);
-  await env.DB.prepare(`
+  const factStatement = env.DB.prepare(`
     UPDATE subscriptions SET
       price = ?, currency = ?, start_date = ?, next_billing_date = ?, auto_calculate_next_billing_date = ?,
       cost_sharing_collection_reminder_enabled = ?, cost_sharing_next_collection_reminder_date = ?, status = ?, updated_at = ?
@@ -194,8 +179,9 @@ export async function renewSubscription(request: Request, env: Env, id: string):
     timestamp,
     auth.user.id,
     id,
-  ).run();
-  await refreshSubscriptionDerivedState(env, auth.user.id, { resetAutoRenewCheck: true });
+  );
+  const derived = subscriptionDerivedMutationPlan(env, { before: existing, after: merged, kind: "update" }, settings);
+  await env.DB.batch([...derived.beforeFact, factStatement, ...derived.afterFact]);
   return successJson(subscriptionPayloadSchema.parse({ subscription: toApiSubscription(merged) }));
 }
 
@@ -233,10 +219,13 @@ export function normalizeSubscriptionBodyForStorage(body: unknown): Subscription
   const parsed = subscriptionStorageBodySchema.parse(body);
   // Worker 没有 PocketBase hook；这里承接 Go 持久层同款规范化，供 create/update/import 三条写入路径共用。
   if (parsed.billingCycle === "custom") {
+    if (parsed.customDays === null || parsed.customDays === undefined || parsed.customCycleUnit === null || parsed.customCycleUnit === undefined) {
+      throw new Error("SUBSCRIPTION_CUSTOM_CYCLE_INVARIANT_VIOLATION");
+    }
     return {
       ...parsed,
-      customDays: parsed.customDays ?? 1,
-      customCycleUnit: parsed.customCycleUnit ?? "day",
+      customDays: parsed.customDays,
+      customCycleUnit: parsed.customCycleUnit,
       oneTimeTermCount: null,
       oneTimeTermUnit: null,
     };
@@ -248,7 +237,7 @@ export function normalizeSubscriptionBodyForStorage(body: unknown): Subscription
       customDays: null,
       customCycleUnit: null,
       oneTimeTermCount: hasTerm ? parsed.oneTimeTermCount : null,
-      oneTimeTermUnit: hasTerm ? parsed.oneTimeTermUnit ?? "month" : null,
+      oneTimeTermUnit: hasTerm ? parsed.oneTimeTermUnit : null,
       autoRenew: false,
       autoCalculateNextBillingDate: false,
     };
@@ -320,6 +309,7 @@ export function toSubscriptionRow(
   options: { settings?: Pick<ApiAppSettings, "timezone" | "notificationReminderDays">; referenceDate?: string } = {},
 ): SubscriptionRow {
   const costSharingMirror = collectionReminderMirror(body, options);
+  const customCycle = subscriptionCustomCycleForStorage(body);
   return {
     id,
     user_id: userId,
@@ -329,8 +319,8 @@ export function toSubscriptionRow(
     currency: body.currency,
     billing_cycle: body.billingCycle,
     // 非 custom 周期必须把自定义字段清空，否则后续编辑会把旧自定义周期“复活”。
-    custom_days: body.billingCycle === "custom" ? body.customDays ?? 1 : null,
-    custom_cycle_unit: body.billingCycle === "custom" ? body.customCycleUnit ?? "day" : null,
+    custom_days: customCycle.days,
+    custom_cycle_unit: customCycle.unit,
     // one-time 服务期是“预付权益期”契约；非 one-time 清空，避免旧买断字段被周期订阅误用于摊销。
     one_time_term_count: body.billingCycle === "one-time" ? body.oneTimeTermCount ?? null : null,
     one_time_term_unit: body.billingCycle === "one-time" ? body.oneTimeTermUnit ?? null : null,
@@ -366,16 +356,12 @@ export function toSubscriptionRow(
   };
 }
 
-export function subscriptionRowValues(row: SubscriptionRow): unknown[] {
-  return [
-    row.id, row.user_id, row.name, row.logo, row.price, row.currency, row.billing_cycle, row.custom_days, row.custom_cycle_unit,
-    row.one_time_term_count, row.one_time_term_unit,
-    row.category, row.status, row.pinned, row.public_hidden, row.payment_method, row.start_date, row.next_billing_date,
-    row.auto_renew, row.auto_calculate_next_billing_date, row.trial_end_date, row.website, row.notes, row.tags_json,
-    row.reminder_days, row.repeat_reminder_enabled, row.repeat_reminder_interval, row.repeat_reminder_window,
-    row.cost_sharing_json, row.cost_sharing_collection_reminder_enabled, row.cost_sharing_next_collection_reminder_date,
-    row.extra_json, row.created_at, row.updated_at,
-  ];
+function subscriptionCustomCycleForStorage(body: SubscriptionBody): { days: number | null; unit: SubscriptionRow["custom_cycle_unit"] } {
+  if (body.billingCycle !== "custom") return { days: null, unit: null };
+  if (body.customDays === null || body.customDays === undefined || body.customCycleUnit === null || body.customCycleUnit === undefined) {
+    throw new Error("SUBSCRIPTION_CUSTOM_CYCLE_INVARIANT_VIOLATION");
+  }
+  return { days: body.customDays, unit: body.customCycleUnit };
 }
 
 export async function refreshCostSharingCollectionReminderMirrors(
@@ -384,9 +370,20 @@ export async function refreshCostSharingCollectionReminderMirrors(
   settings: Pick<ApiAppSettings, "timezone" | "notificationReminderDays">,
   referenceDate = dateOnlyInZone(new Date(), settings.timezone),
 ): Promise<void> {
+  const statements = await buildCostSharingCollectionReminderMirrorStatements(env, userId, settings, referenceDate);
+  if (statements.length > 0) await env.DB.batch(statements);
+}
+
+export async function buildCostSharingCollectionReminderMirrorStatements(
+  env: Env,
+  userId: string,
+  settings: Pick<ApiAppSettings, "timezone" | "notificationReminderDays">,
+  referenceDate = dateOnlyInZone(new Date(), settings.timezone),
+): Promise<D1PreparedStatement[]> {
   const rows = await env.DB.prepare(`SELECT ${SUBSCRIPTION_COLUMNS} FROM subscriptions WHERE user_id = ?`)
     .bind(userId)
     .all<SubscriptionRow>();
+  const statements: D1PreparedStatement[] = [];
   for (const row of rows.results) {
     const costSharingJson = parseJsonObject(row.cost_sharing_json ?? "{}");
     const costSharing = Object.keys(costSharingJson).length > 0 ? costSharingJson as SubscriptionBody["costSharing"] : null;
@@ -396,12 +393,13 @@ export async function refreshCostSharingCollectionReminderMirrors(
       continue;
     }
     // settings 的全局提醒天数/时区会影响 inherited 收款提醒；刷新只动内部索引镜像，不反写 cost_sharing_json。
-    await env.DB.prepare(`
+    statements.push(env.DB.prepare(`
       UPDATE subscriptions
       SET cost_sharing_collection_reminder_enabled = ?, cost_sharing_next_collection_reminder_date = ?
       WHERE user_id = ? AND id = ?
-    `).bind(enabled, mirror.nextReminderDate, userId, row.id).run();
+    `).bind(enabled, mirror.nextReminderDate, userId, row.id));
   }
+  return statements;
 }
 
 function collectionReminderMirror(

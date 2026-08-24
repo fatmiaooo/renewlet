@@ -262,6 +262,7 @@ func TestEnsureSchemaCreatesContractFieldsAndIndexes(t *testing.T) {
 	assertIndex(t, app, "calendar_feeds", "idx_calendar_feeds_user_all_unique")
 	assertIndex(t, app, "calendar_feeds", "idx_calendar_feeds_token_unique")
 	assertIndex(t, app, "calendar_feeds", "idx_calendar_feeds_user_subscription_unique")
+	assertIndex(t, app, "calendar_feeds", "idx_calendar_feeds_user_scope_updated_id")
 	assertIndex(t, app, "public_status_pages", "idx_public_status_pages_user_unique")
 	assertIndex(t, app, "public_status_pages", "idx_public_status_pages_token_unique")
 	assertIndex(t, app, "api_tokens", "idx_api_tokens_user_created")
@@ -416,6 +417,9 @@ func TestEnsureSchemaSelfHealsSubscriptionLogoURLFieldToText(t *testing.T) {
 	if err := upsertField(subscriptions, &core.NumberField{Name: "price"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := upsertField(subscriptions, &core.SelectField{Name: "status", Required: true, Values: []string{"trial", "active", "expired", "paused", "cancelled"}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := app.Save(subscriptions); err != nil {
 		t.Fatal(err)
 	}
@@ -429,6 +433,7 @@ func TestEnsureSchemaSelfHealsSubscriptionLogoURLFieldToText(t *testing.T) {
 	record := core.NewRecord(subscriptions)
 	record.Set("user", user.Id)
 	record.Set("name", "Logo Field")
+	record.Set("status", "active")
 	record.Set("logo", "https://example.com/logo.png")
 	record.Set("price", 12.5)
 	if err := app.Save(record); err != nil {
@@ -479,6 +484,9 @@ func TestEnsureSchemaMigratesLegacySubscriptionPriceNumberFieldToText(t *testing
 	if err := upsertField(subscriptions, &core.NumberField{Name: "price"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := upsertField(subscriptions, &core.SelectField{Name: "status", Required: true, Values: []string{"trial", "active", "expired", "paused", "cancelled"}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := app.Save(subscriptions); err != nil {
 		t.Fatal(err)
 	}
@@ -493,6 +501,7 @@ func TestEnsureSchemaMigratesLegacySubscriptionPriceNumberFieldToText(t *testing
 	record := core.NewRecord(subscriptions)
 	record.Set("user", user.Id)
 	record.Set("name", "Legacy Price")
+	record.Set("status", "active")
 	record.Set("logo", "https://example.com/logo.png")
 	record.Set("price", 12.5)
 	if err := app.Save(record); err != nil {

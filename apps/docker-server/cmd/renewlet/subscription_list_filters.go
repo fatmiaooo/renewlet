@@ -1,6 +1,10 @@
 package main
 
+// subscription_list_filters.go 只在 owner-scoped 派生投影上筛选和分页，再一次性回表读取完整事实记录。
+// cursor 只裁当前页，total 始终来自同一完整过滤集，避免滚动后总数递减或筛选口径漂移。
+
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -45,23 +49,54 @@ type subscriptionListPage struct {
 }
 
 func parseSubscriptionListQuery(values url.Values) (subscriptionListQuery, error) {
-	limit, err := parsePositiveQueryInt(values.Get("limit"), subscriptionListDefaultLimit, 1, subscriptionListMaxLimit)
+	return parseSubscriptionCollectionQuery(values, true)
+}
+
+func parseSubscriptionIndexQuery(values url.Values) (subscriptionListQuery, error) {
+	return parseSubscriptionCollectionQuery(values, false)
+}
+
+func parseSubscriptionCollectionQuery(values url.Values, paginated bool) (subscriptionListQuery, error) {
+	for key := range values {
+		if isSubscriptionCollectionFilterKey(key) || paginated && (key == "limit" || key == "cursor") {
+			continue
+		}
+		return subscriptionListQuery{}, fmt.Errorf("unsupported subscription query parameter %q", key)
+	}
+	limit := subscriptionListDefaultLimit
+	var err error
+	if paginated {
+		if rawLimits, ok := values["limit"]; ok && (len(rawLimits) != 1 || strings.TrimSpace(rawLimits[0]) == "") {
+			return subscriptionListQuery{}, errors.New("invalid limit query value")
+		}
+		limit, err = parsePositiveQueryInt(values.Get("limit"), subscriptionListDefaultLimit, 1, subscriptionListMaxLimit)
+	}
 	if err != nil {
 		return subscriptionListQuery{}, err
 	}
 	query := subscriptionListQuery{Limit: limit}
-	if rawCursor := strings.TrimSpace(values.Get("cursor")); rawCursor != "" {
+	if paginated {
+		rawCursors, hasCursor := values["cursor"]
+		if !hasCursor {
+			return parseSubscriptionCollectionFilters(values, query)
+		}
+		if len(rawCursors) != 1 || strings.TrimSpace(rawCursors[0]) == "" {
+			return subscriptionListQuery{}, errors.New("invalid cursor query value")
+		}
+		rawCursor := strings.TrimSpace(rawCursors[0])
 		cursor, err := parseSubscriptionCursorPayload(rawCursor)
 		if err != nil {
 			return subscriptionListQuery{}, err
 		}
 		query.Cursor = &cursor
 	}
-	if search := strings.TrimSpace(values.Get("q")); search != "" {
-		if len(search) > subscriptionListSearchMaxLength {
-			return subscriptionListQuery{}, errors.New("invalid search query")
-		}
-		query.Search = search
+	return parseSubscriptionCollectionFilters(values, query)
+}
+
+func parseSubscriptionCollectionFilters(values url.Values, query subscriptionListQuery) (subscriptionListQuery, error) {
+	var err error
+	if query.Search, err = parseSubscriptionListSingle(values, "q", subscriptionListSearchMaxLength, nil); err != nil {
+		return subscriptionListQuery{}, err
 	}
 	if query.Categories, err = parseSubscriptionListStrings(values["category"], 50, 80, nil); err != nil {
 		return subscriptionListQuery{}, err
@@ -108,14 +143,19 @@ func parseSubscriptionListQuery(values url.Values) (subscriptionListQuery, error
 	return query, nil
 }
 
+func isSubscriptionCollectionFilterKey(key string) bool {
+	switch key {
+	case "q", "category", "tag", "billingCycle", "paymentMethod", "currency", "status", "renewal",
+		"nextBillingFrom", "nextBillingTo", "pinned", "publicHidden", "reminderMode", "repeatReminder":
+		return true
+	default:
+		return false
+	}
+}
+
 func listSubscriptionRecordsForQuery(app core.App, userID string, query subscriptionListQuery, today string) (subscriptionListPage, error) {
-	if err := ensureSubscriptionListStateFresh(app, userID); err != nil {
-		return subscriptionListPage{}, err
-	}
-	if !query.hasFilters() {
-		return listProjectedDefaultSubscriptionRecords(app, userID, query)
-	}
-	total, pageIDs, err := collectProjectedSubscriptionPageIDs(app, userID, query, today)
+	// 该入口的查询预算固定为一次投影页查询和一次批量事实回表；禁止恢复逐 ID PocketBase 查询。
+	pageIDs, total, err := projectedSubscriptionPageIDs(app, userID, query, today)
 	if err != nil {
 		return subscriptionListPage{}, err
 	}
@@ -132,68 +172,54 @@ func listSubscriptionRecordsForQuery(app core.App, userID string, query subscrip
 	return subscriptionListPage{Rows: rows, NextCursor: nextCursor, Total: total}, nil
 }
 
-func listProjectedDefaultSubscriptionRecords(app core.App, userID string, query subscriptionListQuery) (subscriptionListPage, error) {
-	pageIDs, err := projectedSubscriptionPageIDs(app, userID, query)
+func boundedSubscriptionRecordsForQuery(
+	app core.App,
+	userID string,
+	query subscriptionListQuery,
+	today string,
+	limit int,
+) (subscriptionListPage, bool, error) {
+	query.Cursor = nil
+	query.Limit = limit
+	pageIDs, total, err := projectedSubscriptionPageIDs(app, userID, query, today)
 	if err != nil {
-		return subscriptionListPage{}, err
+		return subscriptionListPage{}, false, err
+	}
+	// 超限只需要投影总数即可判定，不能先把 5001 条完整 PocketBase 记录搬进内存再丢弃。
+	if total > int64(limit) {
+		return subscriptionListPage{Total: total}, true, nil
 	}
 	rows, err := getSubscriptionRecordsByIDs(app, userID, pageIDs)
 	if err != nil {
-		return subscriptionListPage{}, err
+		return subscriptionListPage{}, false, err
 	}
-	var nextCursor *string
-	if len(rows) > query.Limit {
-		rows = rows[:query.Limit]
-		cursor := encodeSubscriptionCursor(rows[len(rows)-1])
-		nextCursor = &cursor
-	}
-	stats, err := getSubscriptionStats(app, userID)
-	if err != nil {
-		return subscriptionListPage{}, err
-	}
-	return subscriptionListPage{Rows: rows, NextCursor: nextCursor, Total: int64(stats.Total)}, nil
+	return subscriptionListPage{Rows: rows, Total: total}, false, nil
 }
 
-func projectedSubscriptionPageIDs(app core.App, userID string, query subscriptionListQuery) ([]string, error) {
+func projectedSubscriptionPageIDs(app core.App, userID string, query subscriptionListQuery, today string) ([]string, int64, error) {
 	base := subscriptionProjectionBaseQuery(userID, query)
-	if query.Cursor != nil {
-		base.conditions = append(base.conditions, "(idx.created_at < {:cursorCreatedAt} OR (idx.created_at = {:cursorCreatedAt} AND idx.subscription_id < {:cursorID}))")
-		base.params["cursorCreatedAt"] = query.Cursor.CreatedAt
-		base.params["cursorID"] = query.Cursor.ID
+	if query.Search != "" {
+		base.conditions = append(base.conditions, "instr(idx.search_text_lower, {:search}) > 0")
+		base.params["search"] = strings.ToLower(strings.TrimSpace(query.Search))
 	}
-	rows, err := runSubscriptionProjectionScan(app, base, query.Limit+1, nil)
+	if query.Status != "" {
+		base.conditions = append(base.conditions, `(CASE
+			WHEN idx.status = 'expired' THEN 'expired'
+			WHEN idx.billing_cycle = 'one-time' AND idx.one_time_term_count <= 0 THEN idx.status
+			WHEN idx.status IN ('active', 'trial') AND idx.next_billing_date < {:today} THEN 'expired'
+			ELSE idx.status
+		END) = {:status}`)
+		base.params["today"] = today
+		base.params["status"] = query.Status
+	}
+	rows, err := runSubscriptionProjectionPage(app, base, query.Limit+1, query.Cursor)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return subscriptionProjectionIDs(rows), nil
-}
-
-func collectProjectedSubscriptionPageIDs(app core.App, userID string, query subscriptionListQuery, today string) (int64, []string, error) {
-	base := subscriptionProjectionBaseQuery(userID, query)
-	total := int64(0)
-	pageIDs := make([]string, 0, query.Limit+1)
-	var scanCursor *subscriptionCursorPayload
-	// 业务 cursor 只影响当前页收集，不影响 total；否则筛选页 total 会随着滚动递减。
-	for {
-		rows, err := runSubscriptionProjectionScan(app, base, subscriptionListScanPageSize, scanCursor)
-		if err != nil {
-			return 0, nil, err
-		}
-		for _, row := range rows {
-			if !subscriptionIndexRowMatchesPostFilters(row, query, today) {
-				continue
-			}
-			total++
-			if len(pageIDs) <= query.Limit && subscriptionIndexRowIsAfterCursor(row, query.Cursor) {
-				pageIDs = append(pageIDs, row.SubscriptionID)
-			}
-		}
-		if len(rows) < subscriptionListScanPageSize {
-			return total, pageIDs, nil
-		}
-		last := rows[len(rows)-1]
-		scanCursor = &subscriptionCursorPayload{CreatedAt: last.CreatedAt, ID: last.SubscriptionID}
+	if len(rows) == 0 {
+		return []string{}, 0, nil
 	}
+	return subscriptionProjectionIDs(rows), int64(rows[0].TotalCount), nil
 }
 
 type subscriptionProjectionBase struct {
@@ -236,27 +262,48 @@ func subscriptionProjectionBaseQuery(userID string, query subscriptionListQuery)
 	return base
 }
 
-func runSubscriptionProjectionScan(app core.App, base subscriptionProjectionBase, limit int, cursor *subscriptionCursorPayload) ([]subscriptionListIndexRow, error) {
-	conditions := append([]string{}, base.conditions...)
+func runSubscriptionProjectionPage(app core.App, base subscriptionProjectionBase, limit int, cursor *subscriptionCursorPayload) ([]subscriptionListIndexRow, error) {
+	pageConditions := []string{"1 = 1"}
 	params := dbx.Params{}
 	for key, value := range base.params {
 		params[key] = value
 	}
 	if cursor != nil {
-		conditions = append(conditions, "(idx.created_at < {:scanCreatedAt} OR (idx.created_at = {:scanCreatedAt} AND idx.subscription_id < {:scanID}))")
-		params["scanCreatedAt"] = cursor.CreatedAt
-		params["scanID"] = cursor.ID
+		pageConditions = append(pageConditions, "(idx.created_at < {:cursorCreatedAt} OR (idx.created_at = {:cursorCreatedAt} AND idx.subscription_id < {:cursorID}))")
+		params["cursorCreatedAt"] = cursor.CreatedAt
+		params["cursorID"] = cursor.ID
 	}
 	params["limit"] = limit
 	var rows []subscriptionListIndexRow
-	// 搜索不是公开全文检索；所有查询先按 idx.user_id 限定，再在当前 owner 的轻量投影内 contains。
-	err := app.DB().NewQuery(fmt.Sprintf(`SELECT subscription_id, user_id, name, website, notes, search_text_lower, category, billing_cycle, currency,
-		payment_method, status, pinned, public_hidden, next_billing_date, trial_end_date, one_time_term_count,
-		auto_renew, reminder_days, repeat_reminder_enabled, created_at, updated_at
-		FROM subscription_list_index AS idx
-		WHERE %s
-		ORDER BY idx.created_at DESC, idx.subscription_id DESC
-		LIMIT {:limit}`, strings.Join(conditions, " AND "))).
+	// filtered CTE 先锁定 owner 并计算完整过滤集；外层 cursor 只裁当前页，不改变 total。
+	err := app.DB().NewQuery(fmt.Sprintf(`WITH filtered AS (
+			SELECT subscription_id, user_id, name, website, notes, search_text_lower, category, billing_cycle, currency,
+				payment_method, status, pinned, public_hidden, next_billing_date, trial_end_date, one_time_term_count,
+				auto_renew, reminder_days, repeat_reminder_enabled, created_at, updated_at
+			FROM subscription_list_index AS idx
+			WHERE %s
+		), page AS (
+			SELECT * FROM filtered AS idx
+			WHERE %s
+			ORDER BY idx.created_at DESC, idx.subscription_id DESC
+			LIMIT {:limit}
+		), totals AS (
+			SELECT COUNT(*) AS total_count FROM filtered
+		)
+			SELECT COALESCE(page.subscription_id, '') AS subscription_id, COALESCE(page.user_id, '') AS user_id,
+			COALESCE(page.name, '') AS name, COALESCE(page.website, '') AS website, COALESCE(page.notes, '') AS notes,
+			COALESCE(page.search_text_lower, '') AS search_text_lower, COALESCE(page.category, '') AS category,
+			COALESCE(page.billing_cycle, '') AS billing_cycle, COALESCE(page.currency, '') AS currency,
+			COALESCE(page.payment_method, '') AS payment_method, COALESCE(page.status, '') AS status,
+			COALESCE(page.pinned, 0) AS pinned, COALESCE(page.public_hidden, 0) AS public_hidden,
+			COALESCE(page.next_billing_date, '') AS next_billing_date, COALESCE(page.trial_end_date, '') AS trial_end_date,
+			COALESCE(page.one_time_term_count, 0) AS one_time_term_count, COALESCE(page.auto_renew, 0) AS auto_renew,
+			COALESCE(page.reminder_days, 0) AS reminder_days,
+			COALESCE(page.repeat_reminder_enabled, 0) AS repeat_reminder_enabled,
+			COALESCE(page.created_at, '') AS created_at, COALESCE(page.updated_at, '') AS updated_at,
+			totals.total_count
+			FROM totals LEFT JOIN page ON 1 = 1
+			ORDER BY page.created_at DESC, page.subscription_id DESC`, strings.Join(base.conditions, " AND "), strings.Join(pageConditions, " AND "))).
 		Bind(params).
 		All(&rows)
 	return rows, err
@@ -345,82 +392,23 @@ func appendSQLReminderModeCondition(base *subscriptionProjectionBase, mode strin
 func subscriptionProjectionIDs(rows []subscriptionListIndexRow) []string {
 	ids := make([]string, 0, len(rows))
 	for _, row := range rows {
-		ids = append(ids, row.SubscriptionID)
+		if row.SubscriptionID != "" {
+			ids = append(ids, row.SubscriptionID)
+		}
 	}
 	return ids
 }
 
-func subscriptionIndexRowMatchesPostFilters(row subscriptionListIndexRow, query subscriptionListQuery, today string) bool {
-	if query.Status != "" && effectiveSubscriptionIndexStatus(row, today) != query.Status {
-		return false
-	}
-	if query.Search != "" && !subscriptionIndexSearchMatches(row, query.Search) {
-		return false
-	}
-	return true
-}
-
-func effectiveSubscriptionIndexStatus(row subscriptionListIndexRow, today string) string {
-	if row.Status == "expired" {
-		return "expired"
-	}
-	if row.BillingCycle == "one-time" && row.OneTimeTermCount <= 0 {
-		return row.Status
-	}
-	if (row.Status == "active" || row.Status == "trial") && isValidDateOnly(row.NextBillingDate) && row.NextBillingDate < today {
-		return "expired"
-	}
-	return row.Status
-}
-
-func subscriptionIndexSearchMatches(row subscriptionListIndexRow, search string) bool {
-	query := strings.ToLower(strings.TrimSpace(search))
-	if query == "" {
-		return true
-	}
-	return strings.Contains(row.SearchTextLower, query)
-}
-
-func subscriptionIndexRowIsAfterCursor(row subscriptionListIndexRow, cursor *subscriptionCursorPayload) bool {
-	if cursor == nil {
-		return true
-	}
-	return row.CreatedAt < cursor.CreatedAt || (row.CreatedAt == cursor.CreatedAt && row.SubscriptionID < cursor.ID)
-}
-
 func subscriptionRecordStringSlice(record *core.Record, name string) []string {
-	value := jsonValueForResponse(record.Get(name), []string{})
-	switch typed := value.(type) {
-	case []string:
-		return typed
-	case []interface{}:
-		out := make([]string, 0, len(typed))
-		for _, item := range typed {
-			if text, ok := item.(string); ok {
-				out = append(out, text)
-			}
-		}
-		return out
-	default:
+	data, err := jsonBytesFromValue(record.Get(name))
+	if err != nil || len(data) == 0 {
 		return []string{}
 	}
-}
-
-func (query subscriptionListQuery) hasFilters() bool {
-	return query.Search != "" ||
-		len(query.Categories) > 0 ||
-		len(query.Tags) > 0 ||
-		len(query.BillingCycles) > 0 ||
-		len(query.PaymentMethods) > 0 ||
-		len(query.Currencies) > 0 ||
-		query.Status != "" ||
-		query.Renewal != "" ||
-		query.NextBillingFrom != "" ||
-		query.NextBillingTo != "" ||
-		query.Pinned != nil ||
-		query.PublicHidden != nil ||
-		query.ReminderMode != "" ||
-		query.RepeatReminder != nil
+	var values []string
+	if err := json.Unmarshal(data, &values); err != nil || values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func parseSubscriptionListStrings(values []string, maxItems int, maxLength int, validate func(string) bool) ([]string, error) {
