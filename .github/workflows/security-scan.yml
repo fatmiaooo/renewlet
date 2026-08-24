@@ -56,17 +56,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
-      # 依赖风险由独立 pnpm-audit job 负责；镜像扫描不在宿主机重复安装整套 workspace。
-      - name: Run pnpm audit
-        run: pnpm audit --audit-level high
-
-  image-scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-
       - name: Set up Node.js
         uses: actions/setup-node@v7.0.0
         with:
@@ -78,6 +67,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Run pnpm audit
+        run: pnpm audit --audit-level high
+
+  image-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # 依赖风险由独立 pnpm-audit job 负责；镜像扫描不在宿主机重复安装整套 workspace。
       - name: Resolve build time
         run: echo "RENEWLET_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
