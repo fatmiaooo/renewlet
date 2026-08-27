@@ -1,6 +1,9 @@
 name: Sync Renewlet Upstream
 
 on:
+  schedule:
+    # 每天 UTC 2 点（北京时间上午 10 点）跟随上游；上游无变化时该次运行会直接跳过。
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 permissions:
